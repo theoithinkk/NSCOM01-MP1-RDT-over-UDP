@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+spec.txt
+pdf_stream_dump.txt

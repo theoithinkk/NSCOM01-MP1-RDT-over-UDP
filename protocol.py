@@ -1,0 +1,58 @@
+import enum
+import struct
+from dataclasses import dataclass
+
+
+MAX_PAYLOAD = 1024
+HEADER_FMT = "!BIIIH"
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
+
+
+class MsgType(enum.IntEnum):
+    SYN = 1
+    SYN_ACK = 2
+    DATA = 3
+    ACK = 4
+    FIN = 5
+    FIN_ACK = 6
+    ERROR = 7
+    REQ = 8
+
+
+@dataclass
+class Packet:
+    msg_type: MsgType
+    session_id: int
+    seq: int
+    ack: int
+    payload: bytes = b""
+
+    def encode(self) -> bytes:
+        payload_len = len(self.payload)
+        if payload_len > MAX_PAYLOAD:
+            raise ValueError(f"Payload too large: {payload_len} > {MAX_PAYLOAD}")
+        header = struct.pack(
+            HEADER_FMT,
+            int(self.msg_type),
+            self.session_id,
+            self.seq,
+            self.ack,
+            payload_len,
+        )
+        return header + self.payload
+
+    @staticmethod
+    def decode(datagram: bytes) -> "Packet":
+        if len(datagram) < HEADER_SIZE:
+            raise ValueError("Datagram too small for header")
+        msg_raw, session_id, seq, ack, payload_len = struct.unpack(
+            HEADER_FMT, datagram[:HEADER_SIZE]
+        )
+        payload = datagram[HEADER_SIZE:]
+        if payload_len != len(payload):
+            raise ValueError("Payload length mismatch")
+        return Packet(MsgType(msg_raw), session_id, seq, ack, payload)
+
+
+def build_error(session_id: int, seq: int, message: str) -> Packet:
+    return Packet(MsgType.ERROR, session_id, seq, 0, message.encode("utf-8", errors="replace"))
