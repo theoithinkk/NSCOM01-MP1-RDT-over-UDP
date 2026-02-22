@@ -39,6 +39,8 @@ def main() -> None:
                 raise FileNotFoundError(args.local_file)
             sent = send_file(sock, server_addr, session, args.local_file)
             print(f"[client] uploaded {sent} bytes <- {args.local_file}")
+    except KeyboardInterrupt:
+        print("\n[client] terminated by user")
     except Exception as exc:
         print(f"[client] error: {exc}")
         raise

@@ -29,36 +29,41 @@ def main() -> None:
     sock.bind((args.host, args.port))
     print(f"[server] listening on {args.host}:{args.port}")
 
-    while True:
-        try:
-            session, client_addr = server_handshake(sock)
-            print(f"[server] session={session.session_id} peer={client_addr}")
-            req_pkt, req_addr = recv_packet(sock, timeout=5.0)
-            if req_addr != client_addr:
-                continue
-            if req_pkt.session_id != session.session_id or req_pkt.msg_type != MsgType.REQ:
-                send_packet(sock, client_addr, build_error(session.session_id, 0, "Session mismatch"))
-                continue
-            op, filename = parse_req(req_pkt.payload)
-            safe_name = os.path.basename(filename)
-            path = os.path.join(args.storage, safe_name)
-            if op == "GET":
-                if not os.path.exists(path):
-                    send_packet(sock, client_addr, build_error(session.session_id, 0, "File not found"))
+    try:
+        while True:
+            try:
+                session, client_addr = server_handshake(sock)
+                print(f"[server] session={session.session_id} peer={client_addr}")
+                req_pkt, req_addr = recv_packet(sock, timeout=5.0)
+                if req_addr != client_addr:
                     continue
-                sent = send_file(sock, client_addr, session, path)
-                print(f"[server] sent {sent} bytes -> {safe_name}")
-            elif op == "PUT":
-                received = recv_file(sock, client_addr, session, path)
-                print(f"[server] received {received} bytes <- {safe_name}")
-            else:
-                send_packet(sock, client_addr, build_error(session.session_id, 0, "Unknown operation"))
-        except TimeoutError:
-            print("[server] timeout; session dropped")
-        except RDTError as exc:
-            print(f"[server] protocol error: {exc}")
-        except Exception as exc:
-            print(f"[server] error: {exc}")
+                if req_pkt.session_id != session.session_id or req_pkt.msg_type != MsgType.REQ:
+                    send_packet(sock, client_addr, build_error(session.session_id, 0, "Session mismatch"))
+                    continue
+                op, filename = parse_req(req_pkt.payload)
+                safe_name = os.path.basename(filename)
+                path = os.path.join(args.storage, safe_name)
+                if op == "GET":
+                    if not os.path.exists(path):
+                        send_packet(sock, client_addr, build_error(session.session_id, 0, "File not found"))
+                        continue
+                    sent = send_file(sock, client_addr, session, path)
+                    print(f"[server] sent {sent} bytes -> {safe_name}")
+                elif op == "PUT":
+                    received = recv_file(sock, client_addr, session, path)
+                    print(f"[server] received {received} bytes <- {safe_name}")
+                else:
+                    send_packet(sock, client_addr, build_error(session.session_id, 0, "Unknown operation"))
+            except TimeoutError:
+                print("[server] timeout; session dropped")
+            except RDTError as exc:
+                print(f"[server] protocol error: {exc}")
+            except Exception as exc:
+                print(f"[server] error: {exc}")
+    except KeyboardInterrupt:
+        print("\n[server] terminated by user")
+    finally:
+        sock.close()
 
 
 if __name__ == "__main__":

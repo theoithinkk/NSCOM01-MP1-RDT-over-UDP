@@ -6,6 +6,9 @@ from protocol import MsgType, Packet, build_error
 from rdt import RDTError, client_handshake, recv_file, recv_packet, send_file, send_packet, server_handshake
 
 
+QUIT_WORDS = {"q", "quit", "exit"}
+
+
 def parse_req(payload: bytes) -> Tuple[str, str]:
     txt = payload.decode("utf-8", errors="replace").strip()
     parts = txt.split(maxsplit=1)
@@ -17,12 +20,16 @@ def parse_req(payload: bytes) -> Tuple[str, str]:
 
 def prompt_text(label: str, default: str) -> str:
     value = input(f"{label} [{default}]: ").strip()
+    if value.lower() in QUIT_WORDS:
+        raise KeyboardInterrupt
     return value or default
 
 
 def prompt_int(label: str, default: int, min_value: int = 1, max_value: int = 65535) -> int:
     while True:
         raw = input(f"{label} [{default}]: ").strip()
+        if raw.lower() in QUIT_WORDS:
+            raise KeyboardInterrupt
         if not raw:
             return default
         try:
@@ -37,6 +44,8 @@ def prompt_int(label: str, default: int, min_value: int = 1, max_value: int = 65
 def prompt_mode() -> str:
     while True:
         mode = input("Select mode: [1] server, [2] client: ").strip().lower()
+        if mode in QUIT_WORDS:
+            raise KeyboardInterrupt
         if mode in ("1", "server", "s"):
             return "server"
         if mode in ("2", "client", "c"):
@@ -47,6 +56,8 @@ def prompt_mode() -> str:
 def prompt_client_op() -> str:
     while True:
         op = input("Operation: [1] get, [2] put: ").strip().lower()
+        if op in QUIT_WORDS:
+            raise KeyboardInterrupt
         if op in ("1", "get", "g"):
             return "get"
         if op in ("2", "put", "p"):
@@ -64,39 +75,43 @@ def run_server() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
     print(f"[server] listening on {host}:{port}")
-
-    while True:
-        try:
-            session, client_addr = server_handshake(sock)
-            print(f"[server] session={session.session_id} peer={client_addr}")
-            req_pkt, req_addr = recv_packet(sock, timeout=5.0)
-            if req_addr != client_addr:
-                continue
-            if req_pkt.session_id != session.session_id or req_pkt.msg_type != MsgType.REQ:
-                send_packet(sock, client_addr, build_error(session.session_id, 0, "Session mismatch"))
-                continue
-
-            op, filename = parse_req(req_pkt.payload)
-            safe_name = os.path.basename(filename)
-            path = os.path.join(storage, safe_name)
-
-            if op == "GET":
-                if not os.path.exists(path):
-                    send_packet(sock, client_addr, build_error(session.session_id, 0, "File not found"))
+    try:
+        while True:
+            try:
+                session, client_addr = server_handshake(sock)
+                print(f"[server] session={session.session_id} peer={client_addr}")
+                req_pkt, req_addr = recv_packet(sock, timeout=5.0)
+                if req_addr != client_addr:
                     continue
-                sent = send_file(sock, client_addr, session, path)
-                print(f"[server] sent {sent} bytes -> {safe_name}")
-            elif op == "PUT":
-                received = recv_file(sock, client_addr, session, path)
-                print(f"[server] received {received} bytes <- {safe_name}")
-            else:
-                send_packet(sock, client_addr, build_error(session.session_id, 0, "Unknown operation"))
-        except TimeoutError:
-            print("[server] timeout; session dropped")
-        except RDTError as exc:
-            print(f"[server] protocol error: {exc}")
-        except Exception as exc:
-            print(f"[server] error: {exc}")
+                if req_pkt.session_id != session.session_id or req_pkt.msg_type != MsgType.REQ:
+                    send_packet(sock, client_addr, build_error(session.session_id, 0, "Session mismatch"))
+                    continue
+
+                op, filename = parse_req(req_pkt.payload)
+                safe_name = os.path.basename(filename)
+                path = os.path.join(storage, safe_name)
+
+                if op == "GET":
+                    if not os.path.exists(path):
+                        send_packet(sock, client_addr, build_error(session.session_id, 0, "File not found"))
+                        continue
+                    sent = send_file(sock, client_addr, session, path)
+                    print(f"[server] sent {sent} bytes -> {safe_name}")
+                elif op == "PUT":
+                    received = recv_file(sock, client_addr, session, path)
+                    print(f"[server] received {received} bytes <- {safe_name}")
+                else:
+                    send_packet(sock, client_addr, build_error(session.session_id, 0, "Unknown operation"))
+            except TimeoutError:
+                print("[server] timeout; session dropped")
+            except RDTError as exc:
+                print(f"[server] protocol error: {exc}")
+            except Exception as exc:
+                print(f"[server] error: {exc}")
+    except KeyboardInterrupt:
+        print("\n[server] stopped by user")
+    finally:
+        sock.close()
 
 
 def run_client() -> None:
@@ -104,7 +119,11 @@ def run_client() -> None:
     server_port = prompt_int("Server port", 9000, 1, 65535)
     op = prompt_client_op()
     remote_file = input("Remote filename: ").strip()
+    if remote_file.lower() in QUIT_WORDS:
+        raise KeyboardInterrupt
     local_file = input("Local file path: ").strip()
+    if local_file.lower() in QUIT_WORDS:
+        raise KeyboardInterrupt
     chunk_size = prompt_int("Chunk size", 1024, 128, 1024)
 
     if not remote_file:
@@ -141,11 +160,15 @@ def run_client() -> None:
 
 def main() -> None:
     print("Reliable UDP File Transfer")
-    mode = prompt_mode()
-    if mode == "server":
-        run_server()
-    else:
-        run_client()
+    print("Type q/quit/exit at prompts or press Ctrl+C anytime to stop.")
+    try:
+        mode = prompt_mode()
+        if mode == "server":
+            run_server()
+        else:
+            run_client()
+    except KeyboardInterrupt:
+        print("\n[app] terminated by user")
 
 
 if __name__ == "__main__":
