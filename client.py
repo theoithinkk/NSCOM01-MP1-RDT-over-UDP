@@ -14,6 +14,7 @@ def main() -> None:
     parser.add_argument("--remote-file", required=True)
     parser.add_argument("--local-file", required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     server_addr = (args.server_host, args.server_port)
@@ -21,7 +22,7 @@ def main() -> None:
     sock.bind(("0.0.0.0", 0))
 
     try:
-        session = client_handshake(sock, server_addr, args.chunk_size)
+        session = client_handshake(sock, server_addr, args.chunk_size, verbose=args.verbose)
         req = Packet(
             msg_type=MsgType.REQ,
             session_id=session.session_id,
@@ -30,14 +31,16 @@ def main() -> None:
             payload=f"{args.op.upper()} {args.remote_file}".encode("utf-8"),
         )
         send_packet(sock, server_addr, req)
+        if args.verbose:
+            print(f"[client] REQ {args.op.upper()} {args.remote_file} session={session.session_id}")
 
         if args.op == "get":
-            received = recv_file(sock, server_addr, session, args.local_file)
+            received = recv_file(sock, server_addr, session, args.local_file, verbose=args.verbose)
             print(f"[client] downloaded {received} bytes -> {args.local_file}")
         else:
             if not os.path.exists(args.local_file):
                 raise FileNotFoundError(args.local_file)
-            sent = send_file(sock, server_addr, session, args.local_file)
+            sent = send_file(sock, server_addr, session, args.local_file, verbose=args.verbose)
             print(f"[client] uploaded {sent} bytes <- {args.local_file}")
     except KeyboardInterrupt:
         print("\n[client] terminated by user")

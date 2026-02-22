@@ -1,3 +1,4 @@
+import argparse
 import os
 import socket
 from typing import Tuple
@@ -65,7 +66,7 @@ def prompt_client_op() -> str:
         print("Invalid operation. Type 1 for get or 2 for put.")
 
 
-def run_server() -> None:
+def run_server(verbose: bool = False) -> None:
     host = prompt_text("Server host", "0.0.0.0")
     port = prompt_int("Server port", 9000, 1, 65535)
     storage = prompt_text("Storage directory", "server_storage")
@@ -78,7 +79,7 @@ def run_server() -> None:
     try:
         while True:
             try:
-                session, client_addr = server_handshake(sock)
+                session, client_addr = server_handshake(sock, verbose=verbose)
                 print(f"[server] session={session.session_id} peer={client_addr}")
                 req_pkt, req_addr = recv_packet(sock, timeout=5.0)
                 if req_addr != client_addr:
@@ -88,6 +89,8 @@ def run_server() -> None:
                     continue
 
                 op, filename = parse_req(req_pkt.payload)
+                if verbose:
+                    print(f"[server] REQ {op} {filename} session={session.session_id}")
                 safe_name = os.path.basename(filename)
                 path = os.path.join(storage, safe_name)
 
@@ -95,10 +98,10 @@ def run_server() -> None:
                     if not os.path.exists(path):
                         send_packet(sock, client_addr, build_error(session.session_id, 0, "File not found"))
                         continue
-                    sent = send_file(sock, client_addr, session, path)
+                    sent = send_file(sock, client_addr, session, path, verbose=verbose)
                     print(f"[server] sent {sent} bytes -> {safe_name}")
                 elif op == "PUT":
-                    received = recv_file(sock, client_addr, session, path)
+                    received = recv_file(sock, client_addr, session, path, verbose=verbose)
                     print(f"[server] received {received} bytes <- {safe_name}")
                 else:
                     send_packet(sock, client_addr, build_error(session.session_id, 0, "Unknown operation"))
@@ -114,7 +117,7 @@ def run_server() -> None:
         sock.close()
 
 
-def run_client() -> None:
+def run_client(verbose: bool = False) -> None:
     server_host = prompt_text("Server host", "127.0.0.1")
     server_port = prompt_int("Server port", 9000, 1, 65535)
     op = prompt_client_op()
@@ -136,7 +139,7 @@ def run_client() -> None:
     sock.bind(("0.0.0.0", 0))
 
     try:
-        session = client_handshake(sock, server_addr, chunk_size)
+        session = client_handshake(sock, server_addr, chunk_size, verbose=verbose)
         req = Packet(
             msg_type=MsgType.REQ,
             session_id=session.session_id,
@@ -145,28 +148,36 @@ def run_client() -> None:
             payload=f"{op.upper()} {remote_file}".encode("utf-8"),
         )
         send_packet(sock, server_addr, req)
+        if verbose:
+            print(f"[client] REQ {op.upper()} {remote_file} session={session.session_id}")
 
         if op == "get":
-            received = recv_file(sock, server_addr, session, local_file)
+            received = recv_file(sock, server_addr, session, local_file, verbose=verbose)
             print(f"[client] downloaded {received} bytes -> {local_file}")
         else:
             if not os.path.exists(local_file):
                 raise FileNotFoundError(local_file)
-            sent = send_file(sock, server_addr, session, local_file)
+            sent = send_file(sock, server_addr, session, local_file, verbose=verbose)
             print(f"[client] uploaded {sent} bytes <- {local_file}")
     finally:
         sock.close()
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Reliable UDP file transfer interactive launcher")
+    parser.add_argument("--verbose", action="store_true", help="Show handshake/session/data debug logs")
+    args = parser.parse_args()
+
     print("Reliable UDP File Transfer")
     print("Type q/quit/exit at prompts or press Ctrl+C anytime to stop.")
+    if args.verbose:
+        print("[app] verbose mode enabled")
     try:
         mode = prompt_mode()
         if mode == "server":
-            run_server()
+            run_server(verbose=args.verbose)
         else:
-            run_client()
+            run_client(verbose=args.verbose)
     except KeyboardInterrupt:
         print("\n[app] terminated by user")
 

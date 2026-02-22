@@ -104,6 +104,11 @@ Interactive one-file launcher:
 python app.py
 ```
 
+Enable detailed handshake/session/data logs:
+```bash
+python app.py --verbose
+```
+
 You will be prompted to choose:
 - mode (`server` or `client`)
 - host/port
@@ -117,13 +122,25 @@ Start server:
 ```bash
 python server.py --host 0.0.0.0 --port 9000 --storage server_storage
 ```
+Verbose:
+```bash
+python server.py --host 0.0.0.0 --port 9000 --storage server_storage --verbose
+```
 
 Download:
 ```bash
 python client.py --server-host 127.0.0.1 --server-port 9000 --op get --remote-file sample.bin --local-file downloads/sample.bin
 ```
+Verbose:
+```bash
+python client.py --server-host 127.0.0.1 --server-port 9000 --op get --remote-file sample.bin --local-file downloads/sample.bin --verbose
+```
 
 Upload:
 ```bash
 python client.py --server-host 127.0.0.1 --server-port 9000 --op put --remote-file upload.bin --local-file ./upload.bin
+```
+Verbose:
+```bash
+python client.py --server-host 127.0.0.1 --server-port 9000 --op put --remote-file upload.bin --local-file ./upload.bin --verbose
 ```
