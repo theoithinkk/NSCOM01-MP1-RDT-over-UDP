@@ -3,7 +3,7 @@ import os
 import socket
 
 from protocol import MsgType, Packet
-from rdt import client_handshake, recv_file, send_file, send_packet
+from rdt import client_handshake, recv_file, send_file, send_packet, set_wire_trace
 
 
 def main() -> None:
@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    set_wire_trace(args.verbose)
 
     server_addr = (args.server_host, args.server_port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

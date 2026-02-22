@@ -4,7 +4,16 @@ import socket
 from typing import Tuple
 
 from protocol import MsgType, Packet, build_error
-from rdt import RDTError, client_handshake, recv_file, recv_packet, send_file, send_packet, server_handshake
+from rdt import (
+    RDTError,
+    client_handshake,
+    recv_file,
+    recv_packet,
+    send_file,
+    send_packet,
+    server_handshake,
+    set_wire_trace,
+)
 
 
 QUIT_WORDS = {"q", "quit", "exit"}
@@ -167,6 +176,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Reliable UDP file transfer interactive launcher")
     parser.add_argument("--verbose", action="store_true", help="Show handshake/session/data debug logs")
     args = parser.parse_args()
+    set_wire_trace(args.verbose)
 
     print("Reliable UDP File Transfer")
     print("Type q/quit/exit at prompts or press Ctrl+C anytime to stop.")

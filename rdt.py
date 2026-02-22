@@ -9,6 +9,7 @@ from protocol import MAX_PAYLOAD, MsgType, Packet, build_error
 
 TIMEOUT_SECONDS = 0.8
 MAX_RETRIES = 10
+WIRE_TRACE_ENABLED = False
 
 
 @dataclass
@@ -28,13 +29,30 @@ def _trace(verbose: bool, message: str) -> None:
         print(f"[rdt] {message}")
 
 
+def set_wire_trace(enabled: bool) -> None:
+    global WIRE_TRACE_ENABLED
+    WIRE_TRACE_ENABLED = enabled
+
+
+def _format_packet(packet: Packet) -> str:
+    return (
+        f"type={packet.msg_type.name} session={packet.session_id} "
+        f"seq={packet.seq} ack={packet.ack} payload_len={len(packet.payload)}"
+    )
+
+
 def recv_packet(sock: socket.socket, timeout: Optional[float] = None) -> Tuple[Packet, Tuple[str, int]]:
     sock.settimeout(timeout)
     data, addr = sock.recvfrom(4096)
-    return Packet.decode(data), addr
+    packet = Packet.decode(data)
+    if WIRE_TRACE_ENABLED:
+        print(f"[wire][recv] from={addr} {_format_packet(packet)}")
+    return packet, addr
 
 
 def send_packet(sock: socket.socket, addr: Tuple[str, int], packet: Packet) -> None:
+    if WIRE_TRACE_ENABLED:
+        print(f"[wire][send] to={addr} {_format_packet(packet)}")
     sock.sendto(packet.encode(), addr)
 
 

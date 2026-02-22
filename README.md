@@ -108,6 +108,7 @@ Enable detailed handshake/session/data logs:
 ```bash
 python app.py --verbose
 ```
+Verbose mode also prints per-packet wire traces for all message types (`SYN`, `SYN-ACK`, `ACK`, `REQ`, `DATA`, `FIN`, `FIN-ACK`, `ERROR`).
 
 You will be prompted to choose:
 - mode (`server` or `client`)

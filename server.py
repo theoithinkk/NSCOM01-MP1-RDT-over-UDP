@@ -4,7 +4,7 @@ import socket
 from typing import Tuple
 
 from protocol import MsgType, Packet, build_error
-from rdt import RDTError, recv_file, recv_packet, send_file, send_packet, server_handshake
+from rdt import RDTError, recv_file, recv_packet, send_file, send_packet, server_handshake, set_wire_trace
 
 
 def parse_req(payload: bytes) -> Tuple[str, str]:
@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--storage", default="server_storage")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    set_wire_trace(args.verbose)
 
     os.makedirs(args.storage, exist_ok=True)
 
