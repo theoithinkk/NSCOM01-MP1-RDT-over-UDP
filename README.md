@@ -99,6 +99,20 @@ End of transfer is explicit:
 - receiver confirms with `FIN-ACK`
 
 ## 9. Usage
+Interactive one-file launcher:
+```bash
+python app.py
+```
+
+You will be prompted to choose:
+- mode (`server` or `client`)
+- host/port
+- storage directory (server mode)
+- operation (`get`/`put`) and file paths (client mode)
+- chunk size (client mode)
+
+Legacy direct commands are still available:
+
 Start server:
 ```bash
 python server.py --host 0.0.0.0 --port 9000 --storage server_storage
