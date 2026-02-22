@@ -48,6 +48,7 @@ Each UDP datagram uses this binary layout (network byte order):
 - `seq` (4 bytes)
 - `ack` (4 bytes)
 - `payload_len` (2 bytes)
+- `checksum` (4 bytes, CRC32)
 - `payload` (`payload_len` bytes, max 1024)
 
 ### 3.1 Message Types
@@ -80,6 +81,8 @@ Each UDP datagram uses this binary layout (network byte order):
 - Per-chunk acknowledgements (`ACK.ack = DATA.seq`).
 - Timeout-based retransmission with bounded retries.
 - Ordered delivery by accepting only expected sequence and re-ACKing last valid sequence for out-of-order packets.
+- Datagram integrity check using CRC32 checksum in packet header.
+- End-to-end file integrity check using SHA-256 (verified at `FIN`).
 
 ## 6. Error Handling
 Implemented checks and responses:
@@ -98,7 +101,51 @@ End of transfer is explicit:
 - sender transmits `FIN` after all data chunks
 - receiver confirms with `FIN-ACK`
 
-## 9. Usage
+## 9. Security and Integrity Details
+### 9.1 Checksum (CRC32)
+- Purpose: detect accidental corruption per UDP datagram.
+- Where implemented:
+  - `protocol.py` -> `Packet.encode()` computes checksum.
+  - `protocol.py` -> `Packet.decode()` verifies checksum.
+- How used:
+  - Sender computes CRC32 over header(with checksum=0) + payload.
+  - Receiver recomputes and compares.
+  - Mismatch raises decode error and packet is dropped.
+
+### 9.2 File Hashing (SHA-256)
+- Purpose: verify end-to-end integrity of the full reconstructed file.
+- Where implemented:
+  - `rdt.py` -> `send_file()` computes SHA-256 while sending chunks.
+  - `rdt.py` -> `recv_file()` computes SHA-256 while receiving chunks.
+- How used:
+  - Sender places `size` and `sha256` metadata in `FIN` payload.
+  - Receiver checks expected size/hash at `FIN`.
+  - If mismatch: receiver sends `ERROR` and does not send `FIN-ACK`.
+
+### 9.3 Authentication (PSK + HMAC Proofs)
+- Purpose: prove both peers know the same shared secret before transfer.
+- Where implemented:
+  - `rdt.py` -> `configure_security()`, `client_handshake()`, `server_handshake()`.
+- How used:
+  - Enabled by `--secure-psk`.
+  - Client sends nonce in `SYN`.
+  - Server returns nonce + HMAC proof in `SYN-ACK`.
+  - Client verifies server proof, sends client proof in final `ACK`.
+  - Server verifies client proof.
+  - Session proceeds only if both proofs are valid.
+
+### 9.4 Encryption (ChaCha20-Poly1305 AEAD)
+- Purpose: provide confidentiality and tamper detection for payload data.
+- Where implemented:
+  - `rdt.py` -> internal `_encrypt_payload()` / `_decrypt_payload()`
+  - `rdt.py` -> `protect_payload()` / `unprotect_payload()`
+- How used:
+  - Enabled by `--secure-psk` (same PSK on both peers).
+  - Applies to payloads of `REQ`, `DATA`, `FIN`, and `ERROR`.
+  - `ACK`/`FIN-ACK` control packets remain payload-empty.
+  - If auth/decrypt check fails, transfer is aborted with error.
+
+## 10. Usage
 Interactive one-file launcher:
 ```bash
 python app.py
@@ -109,6 +156,11 @@ Enable detailed handshake/session/data logs:
 python app.py --verbose
 ```
 Verbose mode also prints per-packet wire traces for all message types (`SYN`, `SYN-ACK`, `ACK`, `REQ`, `DATA`, `FIN`, `FIN-ACK`, `ERROR`).
+
+Enable authenticated + encrypted mode (both peers must use same PSK):
+```bash
+python app.py --secure-psk "your-shared-secret"
+```
 
 You will be prompted to choose:
 - mode (`server` or `client`)
@@ -127,6 +179,10 @@ Verbose:
 ```bash
 python server.py --host 0.0.0.0 --port 9000 --storage server_storage --verbose
 ```
+Secure:
+```bash
+python server.py --host 0.0.0.0 --port 9000 --storage server_storage --secure-psk "your-shared-secret"
+```
 
 Download:
 ```bash
@@ -135,6 +191,10 @@ python client.py --server-host 127.0.0.1 --server-port 9000 --op get --remote-fi
 Verbose:
 ```bash
 python client.py --server-host 127.0.0.1 --server-port 9000 --op get --remote-file sample.bin --local-file downloads/sample.bin --verbose
+```
+Secure:
+```bash
+python client.py --server-host 127.0.0.1 --server-port 9000 --op get --remote-file sample.bin --local-file downloads/sample.bin --secure-psk "your-shared-secret"
 ```
 
 Upload:
@@ -145,3 +205,18 @@ Verbose:
 ```bash
 python client.py --server-host 127.0.0.1 --server-port 9000 --op put --remote-file upload.bin --local-file ./upload.bin --verbose
 ```
+Secure:
+```bash
+python client.py --server-host 127.0.0.1 --server-port 9000 --op put --remote-file upload.bin --local-file ./upload.bin --secure-psk "your-shared-secret"
+```
+
+### 10.1 Secure Mode Notes
+- Install dependency once:
+```bash
+py -3 -m pip install cryptography
+```
+- Security in secure mode:
+  - Handshake authentication: HMAC-based PSK proof exchange.
+  - Payload encryption/authentication: ChaCha20-Poly1305 AEAD.
+  - Packet checksum: CRC32 still applied at transport packet level.
+  - End-to-end file hash: SHA-256 verification at `FIN`.

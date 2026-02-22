@@ -1,10 +1,11 @@
 import enum
 import struct
+import zlib
 from dataclasses import dataclass
 
 
 MAX_PAYLOAD = 1024
-HEADER_FMT = "!BIIIH"
+HEADER_FMT = "!BIIIHI"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 
@@ -31,6 +32,16 @@ class Packet:
         payload_len = len(self.payload)
         if payload_len > MAX_PAYLOAD:
             raise ValueError(f"Payload too large: {payload_len} > {MAX_PAYLOAD}")
+        header_wo_checksum = struct.pack(
+            HEADER_FMT,
+            int(self.msg_type),
+            self.session_id,
+            self.seq,
+            self.ack,
+            payload_len,
+            0,
+        )
+        checksum = zlib.crc32(header_wo_checksum + self.payload) & 0xFFFFFFFF
         header = struct.pack(
             HEADER_FMT,
             int(self.msg_type),
@@ -38,6 +49,7 @@ class Packet:
             self.seq,
             self.ack,
             payload_len,
+            checksum,
         )
         return header + self.payload
 
@@ -45,12 +57,24 @@ class Packet:
     def decode(datagram: bytes) -> "Packet":
         if len(datagram) < HEADER_SIZE:
             raise ValueError("Datagram too small for header")
-        msg_raw, session_id, seq, ack, payload_len = struct.unpack(
+        msg_raw, session_id, seq, ack, payload_len, checksum = struct.unpack(
             HEADER_FMT, datagram[:HEADER_SIZE]
         )
         payload = datagram[HEADER_SIZE:]
         if payload_len != len(payload):
             raise ValueError("Payload length mismatch")
+        header_wo_checksum = struct.pack(
+            HEADER_FMT,
+            msg_raw,
+            session_id,
+            seq,
+            ack,
+            payload_len,
+            0,
+        )
+        expected_checksum = zlib.crc32(header_wo_checksum + payload) & 0xFFFFFFFF
+        if checksum != expected_checksum:
+            raise ValueError("Checksum mismatch")
         return Packet(MsgType(msg_raw), session_id, seq, ack, payload)
 
 

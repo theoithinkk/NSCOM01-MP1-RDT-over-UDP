@@ -1,8 +1,11 @@
+import hashlib
+import hmac
 import os
 import random
 import socket
+import struct
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from protocol import MAX_PAYLOAD, MsgType, Packet, build_error
 
@@ -10,6 +13,21 @@ from protocol import MAX_PAYLOAD, MsgType, Packet, build_error
 TIMEOUT_SECONDS = 0.8
 MAX_RETRIES = 10
 WIRE_TRACE_ENABLED = False
+WIRE_TRACE_ROLE = "APP"
+SECURITY_STATUS_PRINTED = False
+COLOR_ENABLED = os.environ.get("NO_COLOR") is None
+SECURE_PSK_BYTES: Optional[bytes] = None
+
+ANSI_RESET = "\x1b[0m"
+ANSI_DIM = "\x1b[2m"
+ANSI_BOLD = "\x1b[1m"
+ANSI_RED = "\x1b[31m"
+ANSI_GREEN = "\x1b[32m"
+ANSI_YELLOW = "\x1b[33m"
+ANSI_BLUE = "\x1b[34m"
+ANSI_MAGENTA = "\x1b[35m"
+ANSI_CYAN = "\x1b[36m"
+ANSI_WHITE = "\x1b[37m"
 
 
 @dataclass
@@ -18,42 +36,217 @@ class Session:
     local_seq: int
     remote_seq: int
     chunk_size: int
+    is_client: bool
+    secure_key: Optional[bytes] = None
 
 
 class RDTError(Exception):
     pass
 
 
+def _paint(text: str, *styles: str) -> str:
+    if not COLOR_ENABLED or not styles:
+        return text
+    return "".join(styles) + text + ANSI_RESET
+
+
+def _msg_style(msg_type: MsgType) -> str:
+    return {
+        MsgType.SYN: ANSI_BLUE,
+        MsgType.SYN_ACK: ANSI_MAGENTA,
+        MsgType.ACK: ANSI_CYAN,
+        MsgType.DATA: ANSI_WHITE,
+        MsgType.FIN: ANSI_YELLOW,
+        MsgType.FIN_ACK: ANSI_GREEN,
+        MsgType.ERROR: ANSI_RED,
+        MsgType.REQ: ANSI_BLUE,
+    }.get(msg_type, ANSI_WHITE)
+
+
 def _trace(verbose: bool, message: str) -> None:
     if verbose:
-        print(f"[rdt] {message}")
+        print(_paint(f"[rdt] {message}", ANSI_DIM, ANSI_CYAN))
 
 
-def set_wire_trace(enabled: bool) -> None:
-    global WIRE_TRACE_ENABLED
+def _security_log(message: str, ok: bool = True) -> None:
+    color = ANSI_GREEN if ok else ANSI_RED
+    print(_paint(f"[SECURITY] {message}", ANSI_BOLD, color))
+
+
+def _require_crypto():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305  # noqa: F401
+    except Exception as exc:
+        raise RDTError(
+            "Secure mode requires 'cryptography'. Install with: py -3 -m pip install cryptography"
+        ) from exc
+
+
+def configure_security(psk: Optional[str]) -> None:
+    global SECURE_PSK_BYTES
+    if psk:
+        _require_crypto()
+        SECURE_PSK_BYTES = psk.encode("utf-8")
+    else:
+        SECURE_PSK_BYTES = None
+
+
+def security_enabled() -> bool:
+    return SECURE_PSK_BYTES is not None
+
+
+def set_wire_trace(enabled: bool, role: str = "APP") -> None:
+    global WIRE_TRACE_ENABLED, WIRE_TRACE_ROLE, SECURITY_STATUS_PRINTED
     WIRE_TRACE_ENABLED = enabled
+    WIRE_TRACE_ROLE = role.upper()
+    if enabled and not SECURITY_STATUS_PRINTED:
+        if security_enabled():
+            print(
+                _paint(
+                    "[SECURITY] integrity=crc32+sha256+aead, encryption=enabled, authentication=psk-hmac",
+                    ANSI_BOLD,
+                    ANSI_YELLOW,
+                )
+            )
+        else:
+            print(
+                _paint(
+                    "[SECURITY] integrity=crc32+sha256, encryption=disabled, authentication=disabled",
+                    ANSI_BOLD,
+                    ANSI_YELLOW,
+                )
+            )
+        SECURITY_STATUS_PRINTED = True
 
 
-def _format_packet(packet: Packet) -> str:
-    return (
-        f"type={packet.msg_type.name} session={packet.session_id} "
-        f"seq={packet.seq} ack={packet.ack} payload_len={len(packet.payload)}"
-    )
+def _format_sent_packet(packet: Packet) -> str:
+    return f"type={_paint(packet.msg_type.name, ANSI_BOLD, _msg_style(packet.msg_type))} segnum={packet.seq}"
+
+
+def _format_received_packet(packet: Packet) -> str:
+    if packet.msg_type == MsgType.DATA:
+        return (
+            f"type={_paint('DATA', ANSI_BOLD, _msg_style(packet.msg_type))} "
+            f"segnum={packet.seq} payload_length={len(packet.payload)}"
+        )
+    return f"type={_paint(packet.msg_type.name, ANSI_BOLD, _msg_style(packet.msg_type))} segnum={packet.seq}"
+
+
+def _parse_kv_payload(payload: bytes) -> Dict[str, str]:
+    text = payload.decode("utf-8", errors="ignore").strip()
+    out: Dict[str, str] = {}
+    for part in text.split(";"):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _derive_session_key(psk: bytes, cnonce: bytes, snonce: bytes, session_id: int) -> bytes:
+    # HKDF-like derivation via HMAC-SHA256 for a single 32-byte key.
+    salt = cnonce + snonce + struct.pack("!I", session_id)
+    return hmac.new(psk, b"rdt-session-key|" + salt, hashlib.sha256).digest()
+
+
+def _server_proof(psk: bytes, cnonce: bytes, snonce: bytes, client_isn: int, server_isn: int, session_id: int) -> str:
+    material = b"server-proof|" + cnonce + snonce + struct.pack("!III", client_isn, server_isn, session_id)
+    return hmac.new(psk, material, hashlib.sha256).hexdigest()
+
+
+def _client_proof(psk: bytes, cnonce: bytes, snonce: bytes, client_isn: int, server_isn: int, session_id: int) -> str:
+    material = b"client-proof|" + cnonce + snonce + struct.pack("!III", client_isn, server_isn, session_id)
+    return hmac.new(psk, material, hashlib.sha256).hexdigest()
+
+
+def _nonce(session_id: int, seq: int, from_client: bool) -> bytes:
+    # 12-byte nonce: session_id(4) + dir(1) + seq(4) + pad(3)
+    direction = b"\x01" if from_client else b"\x00"
+    return struct.pack("!I", session_id) + direction + struct.pack("!I", seq) + b"\x00\x00\x00"
+
+
+def _aad(msg_type: MsgType, session_id: int, seq: int, ack: int) -> bytes:
+    return struct.pack("!BIII", int(msg_type), session_id, seq, ack)
+
+
+def _encrypt_payload(session: Session, msg_type: MsgType, seq: int, ack: int, payload: bytes, outbound: bool) -> bytes:
+    if not session.secure_key:
+        return payload
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+    from_client = session.is_client if outbound else (not session.is_client)
+    cipher = ChaCha20Poly1305(session.secure_key)
+    ciphertext = cipher.encrypt(_nonce(session.session_id, seq, from_client), payload, _aad(msg_type, session.session_id, seq, ack))
+    return ciphertext
+
+
+def _decrypt_payload(session: Session, msg_type: MsgType, seq: int, ack: int, payload: bytes, outbound: bool) -> bytes:
+    if not session.secure_key:
+        return payload
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+    from_client = session.is_client if outbound else (not session.is_client)
+    cipher = ChaCha20Poly1305(session.secure_key)
+    try:
+        return cipher.decrypt(_nonce(session.session_id, seq, from_client), payload, _aad(msg_type, session.session_id, seq, ack))
+    except Exception as exc:
+        raise RDTError("AEAD authentication failed") from exc
+
+
+def _build_fin_payload(total_size: int, digest_hex: str) -> bytes:
+    return f"EOF|size={total_size}|sha256={digest_hex}".encode("utf-8")
+
+
+def _parse_fin_payload(payload: bytes) -> Tuple[Optional[int], Optional[str]]:
+    try:
+        text = payload.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return None, None
+    if not text.startswith("EOF"):
+        return None, None
+    parts = text.split("|")
+    size_value: Optional[int] = None
+    hash_value: Optional[str] = None
+    for part in parts[1:]:
+        if part.startswith("size="):
+            try:
+                size_value = int(part.split("=", 1)[1])
+            except ValueError:
+                size_value = None
+        elif part.startswith("sha256="):
+            hash_value = part.split("=", 1)[1].strip().lower()
+    return size_value, hash_value
 
 
 def recv_packet(sock: socket.socket, timeout: Optional[float] = None) -> Tuple[Packet, Tuple[str, int]]:
     sock.settimeout(timeout)
     data, addr = sock.recvfrom(4096)
-    packet = Packet.decode(data)
+    try:
+        packet = Packet.decode(data)
+    except ValueError as exc:
+        if WIRE_TRACE_ENABLED and "Checksum mismatch" in str(exc):
+            _security_log("CRC32 verification failed (packet dropped)", ok=False)
+        raise
     if WIRE_TRACE_ENABLED:
-        print(f"[wire][recv] from={addr} {_format_packet(packet)}")
+        print(
+            f"[{WIRE_TRACE_ROLE}] Message received from={addr} "
+            f"{_format_received_packet(packet)} {_paint('integrity=crc32_ok', ANSI_GREEN)}"
+        )
     return packet, addr
 
 
 def send_packet(sock: socket.socket, addr: Tuple[str, int], packet: Packet) -> None:
     if WIRE_TRACE_ENABLED:
-        print(f"[wire][send] to={addr} {_format_packet(packet)}")
+        print(f"[{WIRE_TRACE_ROLE}] Message sent to={addr} {_format_sent_packet(packet)}")
     sock.sendto(packet.encode(), addr)
+
+
+def protect_payload(session: Session, msg_type: MsgType, seq: int, ack: int, payload: bytes, outbound: bool = True) -> bytes:
+    return _encrypt_payload(session, msg_type, seq, ack, payload, outbound=outbound)
+
+
+def unprotect_payload(session: Session, msg_type: MsgType, seq: int, ack: int, payload: bytes, outbound: bool = False) -> bytes:
+    return _decrypt_payload(session, msg_type, seq, ack, payload, outbound=outbound)
 
 
 def expect_ack(
@@ -79,7 +272,6 @@ def expect_ack(
             f" type={pkt.msg_type.name} ack={pkt.ack}",
         )
         raise RDTError("Expected ACK for sequence")
-    _trace(verbose, f"received ACK ack={pkt.ack} for seq={expect_ack_for}")
     return pkt
 
 
@@ -116,42 +308,54 @@ def client_handshake(
     verbose: bool = False,
 ) -> Session:
     client_isn = random.randint(1, 1_000_000)
+    cnonce = os.urandom(16)
+    secure = security_enabled()
+    syn_payload = f"chunk={chunk_size};secure={1 if secure else 0}".encode("utf-8")
+    if secure:
+        syn_payload += f";cnonce={cnonce.hex()}".encode("utf-8")
+
     syn = Packet(
         msg_type=MsgType.SYN,
         session_id=0,
         seq=client_isn,
         ack=0,
-        payload=f"chunk={chunk_size}".encode("utf-8"),
+        payload=syn_payload,
     )
-    for attempt in range(1, MAX_RETRIES + 1):
-        _trace(verbose, f"client handshake: send SYN isn={client_isn} attempt={attempt}/{MAX_RETRIES}")
+    for _ in range(MAX_RETRIES):
         send_packet(sock, server_addr, syn)
         try:
             pkt, addr = recv_packet(sock, timeout=TIMEOUT_SECONDS)
             if addr != server_addr:
-                _trace(verbose, f"client handshake: ignored packet from {addr}")
                 continue
             if pkt.msg_type != MsgType.SYN_ACK:
-                _trace(verbose, f"client handshake: expected SYN_ACK got {pkt.msg_type.name}")
                 continue
             if pkt.ack != client_isn:
-                _trace(verbose, f"client handshake: SYN_ACK ack mismatch got={pkt.ack} expected={client_isn}")
                 continue
             session_id = pkt.session_id
             server_isn = pkt.seq
-            _trace(
-                verbose,
-                f"client handshake: received SYN_ACK session={session_id} server_isn={server_isn}",
-            )
-            ack = Packet(MsgType.ACK, session_id, client_isn + 1, server_isn, b"")
+            secure_key: Optional[bytes] = None
+            ack_payload = b""
+
+            if secure:
+                fields = _parse_kv_payload(pkt.payload)
+                snonce_hex = fields.get("snonce")
+                sproof = fields.get("sproof")
+                if not snonce_hex or not sproof:
+                    raise RDTError("Secure handshake failed: missing server proof")
+                snonce = bytes.fromhex(snonce_hex)
+                assert SECURE_PSK_BYTES is not None
+                expect_sproof = _server_proof(SECURE_PSK_BYTES, cnonce, snonce, client_isn, server_isn, session_id)
+                if not hmac.compare_digest(expect_sproof, sproof):
+                    raise RDTError("Secure handshake failed: invalid server proof")
+                cproof = _client_proof(SECURE_PSK_BYTES, cnonce, snonce, client_isn, server_isn, session_id)
+                ack_payload = f"cproof={cproof}".encode("utf-8")
+                secure_key = _derive_session_key(SECURE_PSK_BYTES, cnonce, snonce, session_id)
+                _security_log("PSK authentication passed")
+
+            ack = Packet(MsgType.ACK, session_id, client_isn + 1, server_isn, ack_payload)
             send_packet(sock, server_addr, ack)
-            _trace(
-                verbose,
-                f"client handshake: sent ACK seq={client_isn + 1} ack={server_isn}; session established",
-            )
-            return Session(session_id, client_isn + 1, server_isn, chunk_size)
+            return Session(session_id, client_isn + 1, server_isn, chunk_size, is_client=True, secure_key=secure_key)
         except socket.timeout:
-            _trace(verbose, "client handshake: timeout waiting SYN_ACK")
             continue
     raise TimeoutError("Handshake failed")
 
@@ -160,47 +364,76 @@ def server_handshake(sock: socket.socket, verbose: bool = False) -> Tuple[Sessio
     while True:
         pkt, addr = recv_packet(sock, timeout=None)
         if pkt.msg_type != MsgType.SYN:
-            _trace(verbose, f"server handshake: ignored non-SYN packet type={pkt.msg_type.name} from {addr}")
             continue
-        _trace(verbose, f"server handshake: received SYN from {addr} client_isn={pkt.seq}")
+
+        fields = _parse_kv_payload(pkt.payload)
         chunk_size = MAX_PAYLOAD
         try:
-            payload = pkt.payload.decode("utf-8", errors="ignore")
-            if payload.startswith("chunk="):
-                asked = int(payload.split("=", 1)[1])
+            if "chunk" in fields:
+                asked = int(fields["chunk"])
                 chunk_size = max(128, min(MAX_PAYLOAD, asked))
         except Exception:
             chunk_size = MAX_PAYLOAD
+
+        secure_requested = fields.get("secure", "0") == "1"
+        if secure_requested and not security_enabled():
+            err = build_error(0, 0, "Secure mode requested but server PSK not configured")
+            send_packet(sock, addr, err)
+            continue
+        if not secure_requested and security_enabled():
+            err = build_error(0, 0, "Server requires secure mode")
+            send_packet(sock, addr, err)
+            continue
+
         session_id = random.randint(1, 2_147_483_647)
         server_isn = random.randint(1, 1_000_000)
-        syn_ack = Packet(MsgType.SYN_ACK, session_id, server_isn, pkt.seq, f"chunk={chunk_size}".encode())
-        _trace(
-            verbose,
-            f"server handshake: send SYN_ACK session={session_id} server_isn={server_isn} chunk={chunk_size}",
-        )
+        secure_key: Optional[bytes] = None
+        syn_ack_payload = f"chunk={chunk_size}".encode("utf-8")
+
+        cnonce = b""
+        snonce = b""
+        if secure_requested:
+            cnonce_hex = fields.get("cnonce")
+            if not cnonce_hex:
+                err = build_error(0, 0, "Secure handshake missing cnonce")
+                send_packet(sock, addr, err)
+                continue
+            cnonce = bytes.fromhex(cnonce_hex)
+            snonce = os.urandom(16)
+            assert SECURE_PSK_BYTES is not None
+            sproof = _server_proof(SECURE_PSK_BYTES, cnonce, snonce, pkt.seq, server_isn, session_id)
+            syn_ack_payload += f";snonce={snonce.hex()};sproof={sproof}".encode("utf-8")
+
+        syn_ack = Packet(MsgType.SYN_ACK, session_id, server_isn, pkt.seq, syn_ack_payload)
         send_packet(sock, addr, syn_ack)
+
         try:
             ack, ack_addr = recv_packet(sock, timeout=TIMEOUT_SECONDS)
             if ack_addr != addr:
-                _trace(verbose, f"server handshake: ACK from unexpected peer {ack_addr}")
                 continue
             if ack.msg_type != MsgType.ACK:
-                _trace(verbose, f"server handshake: expected ACK got {ack.msg_type.name}")
                 continue
             if ack.session_id != session_id or ack.ack != server_isn:
-                _trace(
-                    verbose,
-                    "server handshake: ACK validation failed "
-                    f"(session={ack.session_id}/{session_id}, ack={ack.ack}/{server_isn})",
-                )
                 continue
-            _trace(
-                verbose,
-                f"server handshake: established session={session_id} peer={addr} client_seq={ack.seq}",
-            )
-            return Session(session_id, server_isn, ack.seq, chunk_size), addr
+
+            if secure_requested:
+                afields = _parse_kv_payload(ack.payload)
+                cproof = afields.get("cproof")
+                if not cproof:
+                    err = build_error(session_id, 0, "Secure handshake missing client proof")
+                    send_packet(sock, addr, err)
+                    continue
+                assert SECURE_PSK_BYTES is not None
+                expect = _client_proof(SECURE_PSK_BYTES, cnonce, snonce, pkt.seq, server_isn, session_id)
+                if not hmac.compare_digest(expect, cproof):
+                    err = build_error(session_id, 0, "Secure handshake invalid client proof")
+                    send_packet(sock, addr, err)
+                    continue
+                secure_key = _derive_session_key(SECURE_PSK_BYTES, cnonce, snonce, session_id)
+                _security_log("PSK authentication passed")
+
+            return Session(session_id, server_isn, ack.seq, chunk_size, is_client=False, secure_key=secure_key), addr
         except socket.timeout:
-            _trace(verbose, "server handshake: timeout waiting final ACK")
             continue
 
 
@@ -213,40 +446,45 @@ def send_file(
 ) -> int:
     seq = session.local_seq + 1
     sent_total = 0
-    _trace(
-        verbose,
-        f"send_file: start session={session.session_id} path={source_path} chunk={session.chunk_size}",
-    )
+    hasher = hashlib.sha256()
+
+    chunk_cap = session.chunk_size
+    if session.secure_key:
+        # AEAD tag overhead.
+        chunk_cap = max(1, session.chunk_size - 16)
+
     with open(source_path, "rb") as f:
         while True:
-            chunk = f.read(session.chunk_size)
+            chunk = f.read(chunk_cap)
             if not chunk:
                 break
-            packet = Packet(MsgType.DATA, session.session_id, seq, 0, chunk)
+            hasher.update(chunk)
+            payload = _encrypt_payload(session, MsgType.DATA, seq, 0, chunk, outbound=True)
+            packet = Packet(MsgType.DATA, session.session_id, seq, 0, payload)
             send_with_retransmit(sock, addr, packet, expect_ack_for=seq, verbose=verbose)
             sent_total += len(chunk)
             seq += 1
-    fin = Packet(MsgType.FIN, session.session_id, seq, 0, b"EOF")
-    _trace(verbose, f"send_file: all DATA sent, sending FIN seq={seq}")
-    for attempt in range(1, MAX_RETRIES + 1):
+
+    digest_hex = hasher.hexdigest()
+    fin_plain = _build_fin_payload(sent_total, digest_hex)
+    fin_payload = _encrypt_payload(session, MsgType.FIN, seq, 0, fin_plain, outbound=True)
+    fin = Packet(MsgType.FIN, session.session_id, seq, 0, fin_payload)
+
+    for _ in range(MAX_RETRIES):
         send_packet(sock, addr, fin)
         try:
             pkt, from_addr = recv_packet(sock, timeout=TIMEOUT_SECONDS)
             if from_addr != addr:
-                _trace(verbose, f"send_file: ignored FIN_ACK from unexpected peer {from_addr}")
                 continue
             if pkt.session_id != session.session_id:
-                _trace(
-                    verbose,
-                    f"send_file: ignored packet with wrong session {pkt.session_id} expected={session.session_id}",
-                )
                 continue
+            if pkt.msg_type == MsgType.ERROR:
+                err_payload = _decrypt_payload(session, MsgType.ERROR, pkt.seq, pkt.ack, pkt.payload, outbound=False)
+                raise RDTError(err_payload.decode("utf-8", errors="replace"))
             if pkt.msg_type == MsgType.FIN_ACK and pkt.ack == seq:
                 session.local_seq = seq
-                _trace(verbose, f"send_file: FIN confirmed on attempt={attempt}/{MAX_RETRIES}")
                 return sent_total
         except socket.timeout:
-            _trace(verbose, f"send_file: timeout waiting FIN_ACK attempt={attempt}/{MAX_RETRIES}")
             continue
     raise TimeoutError("FIN/FIN-ACK failed")
 
@@ -260,53 +498,87 @@ def recv_file(
 ) -> int:
     expected_seq = session.remote_seq + 1
     got_total = 0
-    _trace(
-        verbose,
-        f"recv_file: start session={session.session_id} path={destination_path} expect_seq={expected_seq}",
-    )
+    hasher = hashlib.sha256()
     os.makedirs(os.path.dirname(destination_path) or ".", exist_ok=True)
+
     with open(destination_path, "wb") as out:
         while True:
             pkt, from_addr = recv_packet(sock, timeout=TIMEOUT_SECONDS * 3)
             if from_addr != addr:
-                _trace(verbose, f"recv_file: ignored packet from unexpected peer {from_addr}")
                 continue
             if pkt.session_id != session.session_id:
                 err = build_error(session.session_id, 0, "Session mismatch")
                 send_packet(sock, addr, err)
-                _trace(
-                    verbose,
-                    f"recv_file: session mismatch got={pkt.session_id} expected={session.session_id}; sent ERROR",
-                )
                 continue
+
             if pkt.msg_type == MsgType.DATA:
                 if pkt.seq == expected_seq:
-                    out.write(pkt.payload)
-                    got_total += len(pkt.payload)
+                    plain = _decrypt_payload(session, MsgType.DATA, pkt.seq, pkt.ack, pkt.payload, outbound=False)
+                    out.write(plain)
+                    got_total += len(plain)
+                    hasher.update(plain)
                     ack = Packet(MsgType.ACK, session.session_id, session.local_seq, pkt.seq, b"")
                     send_packet(sock, addr, ack)
-                    _trace(
-                        verbose,
-                        f"recv_file: accepted DATA seq={pkt.seq} bytes={len(pkt.payload)} sent ACK",
-                    )
                     expected_seq += 1
                 else:
                     last_ok = expected_seq - 1
                     ack = Packet(MsgType.ACK, session.session_id, session.local_seq, last_ok, b"")
                     send_packet(sock, addr, ack)
-                    _trace(
-                        verbose,
-                        f"recv_file: out-of-order DATA seq={pkt.seq} expected={expected_seq}; re-ACK {last_ok}",
-                    )
+
             elif pkt.msg_type == MsgType.FIN:
+                fin_plain = _decrypt_payload(session, MsgType.FIN, pkt.seq, pkt.ack, pkt.payload, outbound=False)
+                expected_size, expected_hash = _parse_fin_payload(fin_plain)
+                actual_hash = hasher.hexdigest()
+
+                if expected_size is not None and expected_size != got_total:
+                    err_payload = _encrypt_payload(
+                        session,
+                        MsgType.ERROR,
+                        session.local_seq,
+                        0,
+                        b"File size mismatch",
+                        outbound=True,
+                    )
+                    err = Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload)
+                    send_packet(sock, addr, err)
+                    _security_log(
+                        f"SHA-256 verification failed (size mismatch expected={expected_size} actual={got_total})",
+                        ok=False,
+                    )
+                    raise RDTError("File size mismatch")
+
+                if expected_hash and expected_hash != actual_hash:
+                    err_payload = _encrypt_payload(
+                        session,
+                        MsgType.ERROR,
+                        session.local_seq,
+                        0,
+                        b"SHA256 mismatch",
+                        outbound=True,
+                    )
+                    err = Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload)
+                    send_packet(sock, addr, err)
+                    _security_log("SHA-256 verification failed (digest mismatch)", ok=False)
+                    raise RDTError("SHA256 mismatch")
+
+                _security_log("SHA-256 verification passed")
                 fin_ack = Packet(MsgType.FIN_ACK, session.session_id, session.local_seq, pkt.seq, b"")
                 send_packet(sock, addr, fin_ack)
                 session.remote_seq = pkt.seq
-                _trace(verbose, f"recv_file: received FIN seq={pkt.seq}, sent FIN_ACK")
                 return got_total
+
             elif pkt.msg_type == MsgType.ERROR:
-                raise RDTError(pkt.payload.decode("utf-8", errors="replace"))
+                err_payload = _decrypt_payload(session, MsgType.ERROR, pkt.seq, pkt.ack, pkt.payload, outbound=False)
+                raise RDTError(err_payload.decode("utf-8", errors="replace"))
+
             else:
-                err = build_error(session.session_id, 0, "Unexpected packet type")
+                err_payload = _encrypt_payload(
+                    session,
+                    MsgType.ERROR,
+                    session.local_seq,
+                    0,
+                    b"Unexpected packet type",
+                    outbound=True,
+                )
+                err = Packet(MsgType.ERROR, session.session_id, 0, 0, err_payload)
                 send_packet(sock, addr, err)
-                _trace(verbose, f"recv_file: unexpected packet type={pkt.msg_type.name}; sent ERROR")

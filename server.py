@@ -3,8 +3,19 @@ import os
 import socket
 from typing import Tuple
 
-from protocol import MsgType, Packet, build_error
-from rdt import RDTError, recv_file, recv_packet, send_file, send_packet, server_handshake, set_wire_trace
+from protocol import MsgType, Packet
+from rdt import (
+    RDTError,
+    configure_security,
+    recv_file,
+    recv_packet,
+    send_file,
+    send_packet,
+    server_handshake,
+    set_wire_trace,
+    protect_payload,
+    unprotect_payload,
+)
 
 
 def parse_req(payload: bytes) -> Tuple[str, str]:
@@ -22,8 +33,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--storage", default="server_storage")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--secure-psk", default="", help="Require secure mode with pre-shared key")
     args = parser.parse_args()
-    set_wire_trace(args.verbose)
+    configure_security(args.secure_psk or None)
+    set_wire_trace(True, "SERVER")
 
     os.makedirs(args.storage, exist_ok=True)
 
@@ -40,16 +53,40 @@ def main() -> None:
                 if req_addr != client_addr:
                     continue
                 if req_pkt.session_id != session.session_id or req_pkt.msg_type != MsgType.REQ:
-                    send_packet(sock, client_addr, build_error(session.session_id, 0, "Session mismatch"))
+                    err_payload = protect_payload(
+                        session,
+                        MsgType.ERROR,
+                        session.local_seq,
+                        0,
+                        b"Session mismatch",
+                        outbound=True,
+                    )
+                    send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
                     continue
-                op, filename = parse_req(req_pkt.payload)
+                req_plain = unprotect_payload(
+                    session,
+                    MsgType.REQ,
+                    req_pkt.seq,
+                    req_pkt.ack,
+                    req_pkt.payload,
+                    outbound=False,
+                )
+                op, filename = parse_req(req_plain)
                 if args.verbose:
                     print(f"[server] REQ {op} {filename} session={session.session_id}")
                 safe_name = os.path.basename(filename)
                 path = os.path.join(args.storage, safe_name)
                 if op == "GET":
                     if not os.path.exists(path):
-                        send_packet(sock, client_addr, build_error(session.session_id, 0, "File not found"))
+                        err_payload = protect_payload(
+                            session,
+                            MsgType.ERROR,
+                            session.local_seq,
+                            0,
+                            b"File not found",
+                            outbound=True,
+                        )
+                        send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
                         continue
                     sent = send_file(sock, client_addr, session, path, verbose=args.verbose)
                     print(f"[server] sent {sent} bytes -> {safe_name}")
@@ -57,7 +94,15 @@ def main() -> None:
                     received = recv_file(sock, client_addr, session, path, verbose=args.verbose)
                     print(f"[server] received {received} bytes <- {safe_name}")
                 else:
-                    send_packet(sock, client_addr, build_error(session.session_id, 0, "Unknown operation"))
+                    err_payload = protect_payload(
+                        session,
+                        MsgType.ERROR,
+                        session.local_seq,
+                        0,
+                        b"Unknown operation",
+                        outbound=True,
+                    )
+                    send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
             except TimeoutError:
                 print("[server] timeout; session dropped")
             except RDTError as exc:

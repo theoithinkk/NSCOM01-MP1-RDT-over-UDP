@@ -3,7 +3,15 @@ import os
 import socket
 
 from protocol import MsgType, Packet
-from rdt import client_handshake, recv_file, send_file, send_packet, set_wire_trace
+from rdt import (
+    client_handshake,
+    configure_security,
+    protect_payload,
+    recv_file,
+    send_file,
+    send_packet,
+    set_wire_trace,
+)
 
 
 def main() -> None:
@@ -15,8 +23,10 @@ def main() -> None:
     parser.add_argument("--local-file", required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--secure-psk", default="", help="Enable secure mode with pre-shared key")
     args = parser.parse_args()
-    set_wire_trace(args.verbose)
+    configure_security(args.secure_psk or None)
+    set_wire_trace(True, "CLIENT")
 
     server_addr = (args.server_host, args.server_port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -24,12 +34,20 @@ def main() -> None:
 
     try:
         session = client_handshake(sock, server_addr, args.chunk_size, verbose=args.verbose)
+        req_payload = protect_payload(
+            session,
+            MsgType.REQ,
+            session.local_seq,
+            0,
+            f"{args.op.upper()} {args.remote_file}".encode("utf-8"),
+            outbound=True,
+        )
         req = Packet(
             msg_type=MsgType.REQ,
             session_id=session.session_id,
             seq=session.local_seq,
             ack=0,
-            payload=f"{args.op.upper()} {args.remote_file}".encode("utf-8"),
+            payload=req_payload,
         )
         send_packet(sock, server_addr, req)
         if args.verbose:

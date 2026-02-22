@@ -3,16 +3,19 @@ import os
 import socket
 from typing import Tuple
 
-from protocol import MsgType, Packet, build_error
+from protocol import MsgType, Packet
 from rdt import (
     RDTError,
     client_handshake,
+    configure_security,
+    protect_payload,
     recv_file,
     recv_packet,
     send_file,
     send_packet,
     server_handshake,
     set_wire_trace,
+    unprotect_payload,
 )
 
 
@@ -94,10 +97,26 @@ def run_server(verbose: bool = False) -> None:
                 if req_addr != client_addr:
                     continue
                 if req_pkt.session_id != session.session_id or req_pkt.msg_type != MsgType.REQ:
-                    send_packet(sock, client_addr, build_error(session.session_id, 0, "Session mismatch"))
+                    err_payload = protect_payload(
+                        session,
+                        MsgType.ERROR,
+                        session.local_seq,
+                        0,
+                        b"Session mismatch",
+                        outbound=True,
+                    )
+                    send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
                     continue
 
-                op, filename = parse_req(req_pkt.payload)
+                req_plain = unprotect_payload(
+                    session,
+                    MsgType.REQ,
+                    req_pkt.seq,
+                    req_pkt.ack,
+                    req_pkt.payload,
+                    outbound=False,
+                )
+                op, filename = parse_req(req_plain)
                 if verbose:
                     print(f"[server] REQ {op} {filename} session={session.session_id}")
                 safe_name = os.path.basename(filename)
@@ -105,7 +124,15 @@ def run_server(verbose: bool = False) -> None:
 
                 if op == "GET":
                     if not os.path.exists(path):
-                        send_packet(sock, client_addr, build_error(session.session_id, 0, "File not found"))
+                        err_payload = protect_payload(
+                            session,
+                            MsgType.ERROR,
+                            session.local_seq,
+                            0,
+                            b"File not found",
+                            outbound=True,
+                        )
+                        send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
                         continue
                     sent = send_file(sock, client_addr, session, path, verbose=verbose)
                     print(f"[server] sent {sent} bytes -> {safe_name}")
@@ -113,7 +140,15 @@ def run_server(verbose: bool = False) -> None:
                     received = recv_file(sock, client_addr, session, path, verbose=verbose)
                     print(f"[server] received {received} bytes <- {safe_name}")
                 else:
-                    send_packet(sock, client_addr, build_error(session.session_id, 0, "Unknown operation"))
+                    err_payload = protect_payload(
+                        session,
+                        MsgType.ERROR,
+                        session.local_seq,
+                        0,
+                        b"Unknown operation",
+                        outbound=True,
+                    )
+                    send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
             except TimeoutError:
                 print("[server] timeout; session dropped")
             except RDTError as exc:
@@ -149,12 +184,20 @@ def run_client(verbose: bool = False) -> None:
 
     try:
         session = client_handshake(sock, server_addr, chunk_size, verbose=verbose)
+        req_payload = protect_payload(
+            session,
+            MsgType.REQ,
+            session.local_seq,
+            0,
+            f"{op.upper()} {remote_file}".encode("utf-8"),
+            outbound=True,
+        )
         req = Packet(
             msg_type=MsgType.REQ,
             session_id=session.session_id,
             seq=session.local_seq,
             ack=0,
-            payload=f"{op.upper()} {remote_file}".encode("utf-8"),
+            payload=req_payload,
         )
         send_packet(sock, server_addr, req)
         if verbose:
@@ -175,8 +218,9 @@ def run_client(verbose: bool = False) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reliable UDP file transfer interactive launcher")
     parser.add_argument("--verbose", action="store_true", help="Show handshake/session/data debug logs")
+    parser.add_argument("--secure-psk", default="", help="Enable secure mode with pre-shared key")
     args = parser.parse_args()
-    set_wire_trace(args.verbose)
+    configure_security(args.secure_psk or None)
 
     print("Reliable UDP File Transfer")
     print("Type q/quit/exit at prompts or press Ctrl+C anytime to stop.")
@@ -185,8 +229,10 @@ def main() -> None:
     try:
         mode = prompt_mode()
         if mode == "server":
+            set_wire_trace(True, "SERVER")
             run_server(verbose=args.verbose)
         else:
+            set_wire_trace(True, "CLIENT")
             run_client(verbose=args.verbose)
     except KeyboardInterrupt:
         print("\n[app] terminated by user")
