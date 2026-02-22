@@ -1,4 +1,5 @@
 import argparse
+import getpass
 import os
 import socket
 from typing import Tuple
@@ -20,6 +21,8 @@ from rdt import (
 
 
 QUIT_WORDS = {"q", "quit", "exit"}
+LINE = "=" * 68
+SUBLINE = "-" * 68
 
 
 def parse_req(payload: bytes) -> Tuple[str, str]:
@@ -31,8 +34,22 @@ def parse_req(payload: bytes) -> Tuple[str, str]:
     return op.upper(), filename
 
 
+def show_banner() -> None:
+    print(LINE)
+    print(" Reliable UDP File Transfer")
+    print(LINE)
+    print(" Type q/quit/exit at prompts or press Ctrl+C anytime to stop.")
+    print(SUBLINE)
+
+
+def show_section(title: str) -> None:
+    print(f"\n{SUBLINE}")
+    print(f" {title}")
+    print(SUBLINE)
+
+
 def prompt_text(label: str, default: str) -> str:
-    value = input(f"{label} [{default}]: ").strip()
+    value = input(f"> {label} [{default}]: ").strip()
     if value.lower() in QUIT_WORDS:
         raise KeyboardInterrupt
     return value or default
@@ -40,7 +57,7 @@ def prompt_text(label: str, default: str) -> str:
 
 def prompt_int(label: str, default: int, min_value: int = 1, max_value: int = 65535) -> int:
     while True:
-        raw = input(f"{label} [{default}]: ").strip()
+        raw = input(f"> {label} [{default}]: ").strip()
         if raw.lower() in QUIT_WORDS:
             raise KeyboardInterrupt
         if not raw:
@@ -54,9 +71,19 @@ def prompt_int(label: str, default: int, min_value: int = 1, max_value: int = 65
             print("Enter a valid integer.")
 
 
+def prompt_required_text(label: str) -> str:
+    while True:
+        value = input(f"> {label}: ").strip()
+        if value.lower() in QUIT_WORDS:
+            raise KeyboardInterrupt
+        if value:
+            return value
+        print(f"{label} is required.")
+
+
 def prompt_mode() -> str:
     while True:
-        mode = input("Select mode: [1] server, [2] client: ").strip().lower()
+        mode = input("> Select mode: [1] server, [2] client: ").strip().lower()
         if mode in QUIT_WORDS:
             raise KeyboardInterrupt
         if mode in ("1", "server", "s"):
@@ -68,7 +95,7 @@ def prompt_mode() -> str:
 
 def prompt_client_op() -> str:
     while True:
-        op = input("Operation: [1] get, [2] put: ").strip().lower()
+        op = input("> Operation: [1] get, [2] put: ").strip().lower()
         if op in QUIT_WORDS:
             raise KeyboardInterrupt
         if op in ("1", "get", "g"):
@@ -78,7 +105,30 @@ def prompt_client_op() -> str:
         print("Invalid operation. Type 1 for get or 2 for put.")
 
 
+def prompt_security_mode() -> str:
+    while True:
+        mode = input("> Security mode: [1] none, [2] psk-aead: ").strip().lower()
+        if mode in QUIT_WORDS:
+            raise KeyboardInterrupt
+        if mode in ("", "1", "none", "n"):
+            return "none"
+        if mode in ("2", "psk", "psk-aead", "secure", "s"):
+            return "psk-aead"
+        print("Invalid choice. Type 1 for none or 2 for psk-aead.")
+
+
+def prompt_psk() -> str:
+    while True:
+        secret = getpass.getpass("> Enter PSK (input hidden): ").strip()
+        if secret.lower() in QUIT_WORDS:
+            raise KeyboardInterrupt
+        if secret:
+            return secret
+        print("PSK cannot be empty.")
+
+
 def run_server(verbose: bool = False) -> None:
+    show_section("Server Configuration")
     host = prompt_text("Server host", "0.0.0.0")
     port = prompt_int("Server port", 9000, 1, 65535)
     storage = prompt_text("Storage directory", "server_storage")
@@ -162,21 +212,23 @@ def run_server(verbose: bool = False) -> None:
 
 
 def run_client(verbose: bool = False) -> None:
+    show_section("Client Configuration")
     server_host = prompt_text("Server host", "127.0.0.1")
     server_port = prompt_int("Server port", 9000, 1, 65535)
     op = prompt_client_op()
-    remote_file = input("Remote filename: ").strip()
-    if remote_file.lower() in QUIT_WORDS:
-        raise KeyboardInterrupt
-    local_file = input("Local file path: ").strip()
-    if local_file.lower() in QUIT_WORDS:
-        raise KeyboardInterrupt
+    if op == "get":
+        print("  GET selected:")
+        print("  - Remote filename = file name on the SERVER to download.")
+        print("  - Local file path = where to save locally (folders allowed, e.g. downloads\\sample2.txt).")
+        remote_file = prompt_required_text("Remote filename (on server)")
+        local_file = prompt_required_text("Local save path (on this machine)")
+    else:
+        print("  PUT selected:")
+        print("  - Local file path = existing file on THIS machine to upload.")
+        print("  - Remote filename = name to store on SERVER.")
+        remote_file = prompt_required_text("Remote filename (save as on server)")
+        local_file = prompt_required_text("Local source file path (must exist)")
     chunk_size = prompt_int("Chunk size", 1024, 128, 1024)
-
-    if not remote_file:
-        raise ValueError("Remote filename is required")
-    if not local_file:
-        raise ValueError("Local file path is required")
 
     server_addr = (server_host, server_port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -220,14 +272,29 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true", help="Show handshake/session/data debug logs")
     parser.add_argument("--secure-psk", default="", help="Enable secure mode with pre-shared key")
     args = parser.parse_args()
-    configure_security(args.secure_psk or None)
 
-    print("Reliable UDP File Transfer")
-    print("Type q/quit/exit at prompts or press Ctrl+C anytime to stop.")
+    show_banner()
     if args.verbose:
         print("[app] verbose mode enabled")
     try:
+        show_section("Security Configuration")
+        if args.secure_psk:
+            configure_security(args.secure_psk)
+            print("[app] security mode: psk-aead (from --secure-psk)")
+        else:
+            sec_mode = prompt_security_mode()
+            if sec_mode == "psk-aead":
+                configure_security(prompt_psk())
+                print("[app] security mode: psk-aead")
+            else:
+                configure_security(None)
+                print("[app] security mode: none")
+
+        show_section("Mode Selection")
         mode = prompt_mode()
+        print(SUBLINE)
+        print(f" Launching in {mode.upper()} mode")
+        print(SUBLINE)
         if mode == "server":
             set_wire_trace(True, "SERVER")
             run_server(verbose=args.verbose)
