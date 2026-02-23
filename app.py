@@ -8,6 +8,7 @@ from protocol import MsgType, Packet
 from rdt import (
     RDTError,
     client_handshake,
+    configure_test_drop_ack,
     configure_security,
     protect_payload,
     recv_file,
@@ -263,6 +264,17 @@ def run_client(verbose: bool = False) -> None:
                 raise FileNotFoundError(local_file)
             sent = send_file(sock, server_addr, session, local_file, verbose=verbose)
             print(f"[client] uploaded {sent} bytes <- {local_file}")
+    except TimeoutError as exc:
+        print(f"[client] timeout: {exc}")
+    except FileNotFoundError as exc:
+        print(f"[client] file not found: {exc}")
+    except RDTError as exc:
+        if str(exc).strip().lower() == "file not found":
+            print("[client] file not found")
+        else:
+            print(f"[client] protocol error: {exc}")
+    except OSError as exc:
+        print(f"[client] network error: {exc}")
     finally:
         sock.close()
 
@@ -271,6 +283,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Reliable UDP file transfer interactive launcher")
     parser.add_argument("--verbose", action="store_true", help="Show handshake/session/data debug logs")
     parser.add_argument("--secure-psk", default="", help="Enable secure mode with pre-shared key")
+    parser.add_argument(
+        "--test-drop-ack",
+        type=float,
+        default=0.0,
+        help="Test hook: probability [0.0-1.0] to drop outbound ACKs while receiving DATA",
+    )
     args = parser.parse_args()
 
     show_banner()
@@ -289,6 +307,7 @@ def main() -> None:
             else:
                 configure_security(None)
                 print("[app] security mode: none")
+        configure_test_drop_ack(args.test_drop_ack)
 
         show_section("Mode Selection")
         mode = prompt_mode()

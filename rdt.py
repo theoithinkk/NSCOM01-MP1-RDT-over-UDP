@@ -17,6 +17,7 @@ WIRE_TRACE_ROLE = "APP"
 SECURITY_STATUS_PRINTED = False
 COLOR_ENABLED = os.environ.get("NO_COLOR") is None
 SECURE_PSK_BYTES: Optional[bytes] = None
+TEST_DROP_ACK_RATE = 0.0
 
 ANSI_RESET = "\x1b[0m"
 ANSI_DIM = "\x1b[2m"
@@ -73,6 +74,10 @@ def _security_log(message: str, ok: bool = True) -> None:
     print(_paint(f"[SECURITY] {message}", ANSI_BOLD, color))
 
 
+def _retransmit_log(message: str) -> None:
+    print(_paint(f"[RETRANSMIT] {message}", ANSI_BOLD, ANSI_YELLOW))
+
+
 def _require_crypto():
     try:
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305  # noqa: F401
@@ -93,6 +98,11 @@ def configure_security(psk: Optional[str]) -> None:
 
 def security_enabled() -> bool:
     return SECURE_PSK_BYTES is not None
+
+
+def configure_test_drop_ack(rate: float) -> None:
+    global TEST_DROP_ACK_RATE
+    TEST_DROP_ACK_RATE = max(0.0, min(1.0, rate))
 
 
 def set_wire_trace(enabled: bool, role: str = "APP") -> None:
@@ -218,9 +228,24 @@ def _parse_fin_payload(payload: bytes) -> Tuple[Optional[int], Optional[str]]:
     return size_value, hash_value
 
 
+def _is_connection_reset_error(exc: BaseException) -> bool:
+    if isinstance(exc, ConnectionResetError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return getattr(exc, "winerror", None) == 10054
+
+
 def recv_packet(sock: socket.socket, timeout: Optional[float] = None) -> Tuple[Packet, Tuple[str, int]]:
     sock.settimeout(timeout)
-    data, addr = sock.recvfrom(4096)
+    try:
+        data, addr = sock.recvfrom(4096)
+    except OSError as exc:
+        # On Windows UDP sockets, peer shutdown can surface as WSAECONNRESET.
+        # Map it to timeout-style handling so retry logic can continue gracefully.
+        if _is_connection_reset_error(exc):
+            raise socket.timeout("Peer became unreachable") from exc
+        raise
     try:
         packet = Packet.decode(data)
     except ValueError as exc:
@@ -284,6 +309,10 @@ def send_with_retransmit(
 ) -> None:
     last_error = "Timeout"
     for attempt in range(1, MAX_RETRIES + 1):
+        if attempt > 1:
+            _retransmit_log(
+                f"retrying {packet.msg_type.name} seq={packet.seq} attempt={attempt}/{MAX_RETRIES}"
+            )
         _trace(
             verbose,
             f"send {packet.msg_type.name} seq={packet.seq} attempt={attempt}/{MAX_RETRIES}",
@@ -291,13 +320,19 @@ def send_with_retransmit(
         send_packet(sock, addr, packet)
         try:
             expect_ack(sock, addr, packet.session_id, expect_ack_for, verbose=verbose)
+            if attempt > 1:
+                _retransmit_log(
+                    f"recovered {packet.msg_type.name} seq={packet.seq} on attempt={attempt}/{MAX_RETRIES}"
+                )
             return
         except (socket.timeout, TimeoutError):
             last_error = "Timeout waiting for ACK"
             _trace(verbose, f"timeout waiting ACK for seq={expect_ack_for}")
+            _retransmit_log(f"timeout waiting ACK for seq={expect_ack_for}")
         except RDTError as exc:
             last_error = str(exc)
             _trace(verbose, f"retransmit reason: {last_error}")
+            _retransmit_log(f"retry reason for seq={expect_ack_for}: {last_error}")
     raise TimeoutError(f"Retransmission failed: {last_error}")
 
 
@@ -499,9 +534,8 @@ def recv_file(
     expected_seq = session.remote_seq + 1
     got_total = 0
     hasher = hashlib.sha256()
-    os.makedirs(os.path.dirname(destination_path) or ".", exist_ok=True)
-
-    with open(destination_path, "wb") as out:
+    out = None
+    try:
         while True:
             pkt, from_addr = recv_packet(sock, timeout=TIMEOUT_SECONDS * 3)
             if from_addr != addr:
@@ -514,16 +548,25 @@ def recv_file(
             if pkt.msg_type == MsgType.DATA:
                 if pkt.seq == expected_seq:
                     plain = _decrypt_payload(session, MsgType.DATA, pkt.seq, pkt.ack, pkt.payload, outbound=False)
+                    if out is None:
+                        os.makedirs(os.path.dirname(destination_path) or ".", exist_ok=True)
+                        out = open(destination_path, "wb")
                     out.write(plain)
                     got_total += len(plain)
                     hasher.update(plain)
                     ack = Packet(MsgType.ACK, session.session_id, session.local_seq, pkt.seq, b"")
-                    send_packet(sock, addr, ack)
+                    if TEST_DROP_ACK_RATE > 0.0 and random.random() < TEST_DROP_ACK_RATE:
+                        _trace(verbose, f"test hook dropped ACK for seq={pkt.seq}")
+                    else:
+                        send_packet(sock, addr, ack)
                     expected_seq += 1
                 else:
                     last_ok = expected_seq - 1
                     ack = Packet(MsgType.ACK, session.session_id, session.local_seq, last_ok, b"")
-                    send_packet(sock, addr, ack)
+                    if TEST_DROP_ACK_RATE > 0.0 and random.random() < TEST_DROP_ACK_RATE:
+                        _trace(verbose, f"test hook dropped duplicate ACK for seq={last_ok}")
+                    else:
+                        send_packet(sock, addr, ack)
 
             elif pkt.msg_type == MsgType.FIN:
                 fin_plain = _decrypt_payload(session, MsgType.FIN, pkt.seq, pkt.ack, pkt.payload, outbound=False)
@@ -561,6 +604,11 @@ def recv_file(
                     _security_log("SHA-256 verification failed (digest mismatch)", ok=False)
                     raise RDTError("SHA256 mismatch")
 
+                if out is None:
+                    # Valid zero-byte file transfer: create file only on successful FIN validation.
+                    os.makedirs(os.path.dirname(destination_path) or ".", exist_ok=True)
+                    out = open(destination_path, "wb")
+
                 _security_log("SHA-256 verification passed")
                 fin_ack = Packet(MsgType.FIN_ACK, session.session_id, session.local_seq, pkt.seq, b"")
                 send_packet(sock, addr, fin_ack)
@@ -582,3 +630,6 @@ def recv_file(
                 )
                 err = Packet(MsgType.ERROR, session.session_id, 0, 0, err_payload)
                 send_packet(sock, addr, err)
+    finally:
+        if out is not None:
+            out.close()

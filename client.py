@@ -4,7 +4,9 @@ import socket
 
 from protocol import MsgType, Packet
 from rdt import (
+    RDTError,
     client_handshake,
+    configure_test_drop_ack,
     configure_security,
     protect_payload,
     recv_file,
@@ -24,8 +26,15 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--secure-psk", default="", help="Enable secure mode with pre-shared key")
+    parser.add_argument(
+        "--test-drop-ack",
+        type=float,
+        default=0.0,
+        help="Test hook: probability [0.0-1.0] to drop outbound ACKs while receiving DATA",
+    )
     args = parser.parse_args()
     configure_security(args.secure_psk or None)
+    configure_test_drop_ack(args.test_drop_ack)
     set_wire_trace(True, "CLIENT")
 
     server_addr = (args.server_host, args.server_port)
@@ -63,9 +72,17 @@ def main() -> None:
             print(f"[client] uploaded {sent} bytes <- {args.local_file}")
     except KeyboardInterrupt:
         print("\n[client] terminated by user")
+    except TimeoutError as exc:
+        print(f"[client] timeout: {exc}")
+    except FileNotFoundError as exc:
+        print(f"[client] file not found: {exc}")
+    except RDTError as exc:
+        if str(exc).strip().lower() == "file not found":
+            print("[client] file not found")
+        else:
+            print(f"[client] protocol error: {exc}")
     except Exception as exc:
         print(f"[client] error: {exc}")
-        raise
     finally:
         sock.close()
 

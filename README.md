@@ -251,3 +251,21 @@ py -3 -m pip install cryptography
   - Payload encryption/authentication: ChaCha20-Poly1305 AEAD.
   - Packet checksum: CRC32 still applied at transport packet level.
   - End-to-end file hash: SHA-256 verification at `FIN`.
+
+### 10.2 Retransmission Test Hook (ACK Drop)
+- Purpose: force retransmissions in a controlled way by intentionally dropping ACKs on the receiver side.
+- Flag: `--test-drop-ack <rate>`
+  - `rate` is a probability from `0.0` to `1.0` (example: `0.2` = 20% ACK drop).
+- Applies only while receiving `DATA` packets (for testing reliability behavior).
+
+Example `PUT` test (server is receiver, so set flag on server):
+```bash
+python server.py --host 0.0.0.0 --port 9000 --storage server_storage --verbose --test-drop-ack 0.2
+python client.py --server-host 127.0.0.1 --server-port 9000 --op put --remote-file upload.bin --local-file ./upload.bin --verbose
+```
+
+Example `GET` test (client is receiver, so set flag on client):
+```bash
+python server.py --host 0.0.0.0 --port 9000 --storage server_storage --verbose
+python client.py --server-host 127.0.0.1 --server-port 9000 --op get --remote-file sample.bin --local-file downloads/sample.bin --verbose --test-drop-ack 0.2
+```

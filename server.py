@@ -6,6 +6,7 @@ from typing import Tuple
 from protocol import MsgType, Packet
 from rdt import (
     RDTError,
+    configure_test_drop_ack,
     configure_security,
     recv_file,
     recv_packet,
@@ -34,8 +35,15 @@ def main() -> None:
     parser.add_argument("--storage", default="server_storage")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--secure-psk", default="", help="Require secure mode with pre-shared key")
+    parser.add_argument(
+        "--test-drop-ack",
+        type=float,
+        default=0.0,
+        help="Test hook: probability [0.0-1.0] to drop outbound ACKs while receiving DATA",
+    )
     args = parser.parse_args()
     configure_security(args.secure_psk or None)
+    configure_test_drop_ack(args.test_drop_ack)
     set_wire_trace(True, "SERVER")
 
     os.makedirs(args.storage, exist_ok=True)
