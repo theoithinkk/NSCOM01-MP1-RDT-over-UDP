@@ -20,25 +20,56 @@ Supported operations:
 - `PUT <filename>`: client uploads file to server
 
 ### 2.1 Message Exchange (Swimlane Style)
-Download:
-1. Client -> Server: `SYN(chunk_size)`
-2. Server -> Client: `SYN-ACK(session_id, server_isn)`
-3. Client -> Server: `ACK`
-4. Client -> Server: `REQ(GET filename)`
-5. Server -> Client: `DATA(seq=n)` (repeated)
-6. Client -> Server: `ACK(ack=n)` (per chunk)
-7. Server -> Client: `FIN(seq=last+1)`
-8. Client -> Server: `FIN-ACK(ack=FIN.seq)`
+Assume secure mode (`--secure-psk`) is enabled.  
+All packets include header CRC32.  
+After handshake, payloads of `REQ`, `DATA`, `FIN`, and `ERROR` are AEAD-protected.
 
-Upload:
-1. Client -> Server: `SYN(chunk_size)`
-2. Server -> Client: `SYN-ACK(session_id, server_isn)`
+Handshake lane:
+1. Client -> Server: `SYN`
+   - `session_id=0`, `seq=client_isn`, `ack=0`
+   - Payload: `chunk=<N>;secure=1;cnonce=<client_nonce_hex>`
+2. Server -> Client: `SYN-ACK`
+   - `session_id=<sid>`, `seq=server_isn`, `ack=client_isn`
+   - Payload: `chunk=<N>;snonce=<server_nonce_hex>;sproof=<hmac_hex>`
+   - Server computes `sproof` with PSK HMAC.
+3. Client verifies `sproof`, derives session key, then Client -> Server: `ACK`
+   - `session_id=<sid>`, `seq=client_isn+1`, `ack=server_isn`
+   - Payload: `cproof=<hmac_hex>`
+4. Server verifies `cproof` and derives the same session key.
+
+GET lane (client downloads):
+1. Client -> Server: `REQ`
+   - `session_id=<sid>`, `seq=client_isn+1`, `ack=0`
+   - Payload (AEAD): `GET <filename>`
+2. Server -> Client: `DATA(seq=n)` repeated for each chunk
+   - Payload (AEAD): chunk bytes
+   - Sender updates running SHA-256 on plaintext chunk before encrypting.
 3. Client -> Server: `ACK`
-4. Client -> Server: `REQ(PUT filename)`
-5. Client -> Server: `DATA(seq=n)` (repeated)
-6. Server -> Client: `ACK(ack=n)` (per chunk)
-7. Client -> Server: `FIN(seq=last+1)`
-8. Server -> Client: `FIN-ACK(ack=FIN.seq)`
+   - `ack=n` for each valid `DATA` received
+   - If out-of-order, client re-ACKs last valid sequence.
+4. Server -> Client: `FIN`
+   - `seq=last_data_seq+1`
+   - Payload (AEAD): `EOF|size=<total_bytes>|sha256=<digest_hex>`
+5. Client validates total size and SHA-256, then Client -> Server: `FIN-ACK`
+   - `ack=FIN.seq`
+   - If validation fails, client sends `ERROR` instead.
+
+PUT lane (client uploads):
+1. Client -> Server: `REQ`
+   - `session_id=<sid>`, `seq=client_isn+1`, `ack=0`
+   - Payload (AEAD): `PUT <filename>`
+2. Client -> Server: `DATA(seq=n)` repeated for each chunk
+   - Payload (AEAD): chunk bytes
+   - Sender updates running SHA-256 on plaintext chunk before encrypting.
+3. Server -> Client: `ACK`
+   - `ack=n` for each valid `DATA` received
+   - If out-of-order, server re-ACKs last valid sequence.
+4. Client -> Server: `FIN`
+   - `seq=last_data_seq+1`
+   - Payload (AEAD): `EOF|size=<total_bytes>|sha256=<digest_hex>`
+5. Server validates total size and SHA-256, then Server -> Client: `FIN-ACK`
+   - `ack=FIN.seq`
+   - If validation fails, server sends `ERROR` instead.
 
 ## 3. Packet Message Format
 Each UDP datagram uses this binary layout (network byte order):
