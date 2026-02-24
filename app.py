@@ -9,6 +9,7 @@ from rdt import (
     RDTError,
     client_handshake,
     configure_encryption,
+    configure_test_delay_ms,
     configure_test_drop_ack,
     configure_security,
     protect_payload,
@@ -304,6 +305,12 @@ def main() -> None:
         default=0.0,
         help="Test hook: probability [0.0-1.0] to drop outbound ACKs while receiving DATA",
     )
+    parser.add_argument(
+        "--test-delay-ms",
+        type=int,
+        default=0,
+        help="Test hook: fixed millisecond delay before outbound ACKs while receiving DATA",
+    )
     args = parser.parse_args()
 
     show_banner()
@@ -327,6 +334,7 @@ def main() -> None:
                 configure_security(None)
                 print("[app] security mode: none")
         configure_test_drop_ack(args.test_drop_ack)
+        configure_test_delay_ms(args.test_delay_ms)
 
         show_section("Mode Selection")
         mode = prompt_mode()

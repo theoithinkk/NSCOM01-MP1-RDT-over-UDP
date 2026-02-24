@@ -4,6 +4,7 @@ import os
 import random
 import socket
 import struct
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -18,6 +19,7 @@ SECURITY_STATUS_PRINTED = False
 COLOR_ENABLED = os.environ.get("NO_COLOR") is None
 SECURE_PSK_BYTES: Optional[bytes] = None
 TEST_DROP_ACK_RATE = 0.0
+TEST_DELAY_MS = 0
 ENCRYPTION_ENABLED = True
 
 ANSI_RESET = "\x1b[0m"
@@ -129,6 +131,12 @@ def encryption_enabled() -> bool:
 def configure_test_drop_ack(rate: float) -> None:
     global TEST_DROP_ACK_RATE
     TEST_DROP_ACK_RATE = max(0.0, min(1.0, rate))
+
+
+# Configures test hook delay (milliseconds) for outbound ACKs while receiving DATA
+def configure_test_delay_ms(delay_ms: int) -> None:
+    global TEST_DELAY_MS
+    TEST_DELAY_MS = max(0, int(delay_ms))
 
 
 # Enables wire tracing and prints one-time security mode summary
@@ -612,6 +620,9 @@ def recv_file(
                     if TEST_DROP_ACK_RATE > 0.0 and random.random() < TEST_DROP_ACK_RATE:
                         _trace(verbose, f"test hook dropped ACK for seq={pkt.seq}")
                     else:
+                        if TEST_DELAY_MS > 0:
+                            _trace(verbose, f"test hook delayed ACK for seq={pkt.seq} by {TEST_DELAY_MS}ms")
+                            time.sleep(TEST_DELAY_MS / 1000.0)
                         send_packet(sock, addr, ack)
                     expected_seq += 1
                 else:
@@ -620,6 +631,9 @@ def recv_file(
                     if TEST_DROP_ACK_RATE > 0.0 and random.random() < TEST_DROP_ACK_RATE:
                         _trace(verbose, f"test hook dropped duplicate ACK for seq={last_ok}")
                     else:
+                        if TEST_DELAY_MS > 0:
+                            _trace(verbose, f"test hook delayed duplicate ACK for seq={last_ok} by {TEST_DELAY_MS}ms")
+                            time.sleep(TEST_DELAY_MS / 1000.0)
                         send_packet(sock, addr, ack)
 
             elif pkt.msg_type == MsgType.FIN:

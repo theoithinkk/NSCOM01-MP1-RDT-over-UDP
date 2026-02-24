@@ -7,6 +7,7 @@ from protocol import MsgType, Packet
 from rdt import (
     RDTError,
     configure_encryption,
+    configure_test_delay_ms,
     configure_test_drop_ack,
     configure_security,
     recv_file,
@@ -45,10 +46,17 @@ def main() -> None:
         default=0.0,
         help="Test hook: probability [0.0-1.0] to drop outbound ACKs while receiving DATA",
     )
+    parser.add_argument(
+        "--test-delay-ms",
+        type=int,
+        default=0,
+        help="Test hook: fixed millisecond delay before outbound ACKs while receiving DATA",
+    )
     args = parser.parse_args()
     configure_encryption(not args.no_encryption)
     configure_security(args.secure_psk or None)
     configure_test_drop_ack(args.test_drop_ack)
+    configure_test_delay_ms(args.test_delay_ms)
     set_wire_trace(True, "SERVER")
 
     os.makedirs(args.storage, exist_ok=True)
