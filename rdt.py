@@ -5,6 +5,7 @@ import random
 import socket
 import struct
 import time
+import ctypes
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -25,13 +26,35 @@ ENCRYPTION_ENABLED = True
 ANSI_RESET = "\x1b[0m"
 ANSI_DIM = "\x1b[2m"
 ANSI_BOLD = "\x1b[1m"
-ANSI_RED = "\x1b[31m"
-ANSI_GREEN = "\x1b[32m"
-ANSI_YELLOW = "\x1b[33m"
-ANSI_BLUE = "\x1b[34m"
-ANSI_MAGENTA = "\x1b[35m"
-ANSI_CYAN = "\x1b[36m"
-ANSI_WHITE = "\x1b[37m"
+ANSI_RED = "\x1b[91m"
+ANSI_GREEN = "\x1b[92m"
+ANSI_YELLOW = "\x1b[93m"
+ANSI_BLUE = "\x1b[94m"
+ANSI_MAGENTA = "\x1b[95m"
+ANSI_CYAN = "\x1b[96m"
+ANSI_WHITE = "\x1b[97m"
+LOG_LINE = "=" * 44
+
+
+def _enable_windows_ansi() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+            return False
+        new_mode = mode.value | 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if kernel32.SetConsoleMode(handle, new_mode) == 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+if COLOR_ENABLED:
+    COLOR_ENABLED = _enable_windows_ansi()
 
 
 # Stores per-session state shared by send/receive logic
@@ -86,6 +109,12 @@ def _security_log(message: str, ok: bool = True) -> None:
 # Emits high-visibility retransmission logs
 def _retransmit_log(message: str) -> None:
     print(_paint(f"[RETRANSMIT] {message}", ANSI_BOLD, ANSI_YELLOW))
+
+
+# Prints a section divider for easier scanning of grouped logs
+def _section(title: str) -> None:
+    print()
+    print(_paint(f"=== {title} ===", ANSI_BLUE))
 
 
 # Ensures cryptography dependency exists before enabling secure mode
@@ -144,6 +173,17 @@ def set_wire_trace(enabled: bool, role: str = "APP") -> None:
     global WIRE_TRACE_ENABLED, WIRE_TRACE_ROLE, SECURITY_STATUS_PRINTED
     WIRE_TRACE_ENABLED = enabled
     WIRE_TRACE_ROLE = role.upper()
+    if enabled:
+        print()
+        print(_paint(f"=== File Transfer Protocol ({WIRE_TRACE_ROLE}) ===", ANSI_CYAN))
+        print(
+            _paint(
+                f"[RUNTIME] timeout={TIMEOUT_SECONDS:.2f}s max_retries={MAX_RETRIES} "
+                f"max_payload={MAX_PAYLOAD} ack_drop_rate={TEST_DROP_ACK_RATE:.2f} ack_delay_ms={TEST_DELAY_MS}",
+                ANSI_WHITE,
+            )
+        )
+        print(_paint(LOG_LINE, ANSI_DIM))
     if enabled and not SECURITY_STATUS_PRINTED:
         if security_enabled():
             if encryption_enabled():
@@ -170,17 +210,39 @@ def set_wire_trace(enabled: bool, role: str = "APP") -> None:
 
 # Builds a compact trace string for sent packets
 def _format_sent_packet(packet: Packet) -> str:
-    return f"type={_paint(packet.msg_type.name, ANSI_BOLD, _msg_style(packet.msg_type))} segnum={packet.seq}"
+    return (
+        f"[Type={_paint(packet.msg_type.name, _msg_style(packet.msg_type))}, "
+        f"SeqNum={packet.seq}, AckNum={packet.ack}, SessionID={packet.session_id}, "
+        f"PayloadLen={len(packet.payload)}]"
+    )
 
 
 # Builds a compact trace string for received packets
 def _format_received_packet(packet: Packet) -> str:
-    if packet.msg_type == MsgType.DATA:
-        return (
-            f"type={_paint('DATA', ANSI_BOLD, _msg_style(packet.msg_type))} "
-            f"segnum={packet.seq} payload_length={len(packet.payload)}"
-        )
-    return f"type={_paint(packet.msg_type.name, ANSI_BOLD, _msg_style(packet.msg_type))} segnum={packet.seq}"
+    return (
+        f"[Type={_paint(packet.msg_type.name, _msg_style(packet.msg_type))}, "
+        f"SeqNum={packet.seq}, AckNum={packet.ack}, SessionID={packet.session_id}, "
+        f"PayloadLen={len(packet.payload)}]"
+    )
+
+
+# Prints key session parameters after handshake for easier verification
+def log_session_parameters(session: Session, peer_addr: Tuple[str, int]) -> None:
+    mode = "secure" if session.secure_key else "plain"
+    _section("Session Parameters")
+    print(_paint(f"SessionID   = {session.session_id}", ANSI_GREEN))
+    print(_paint(f"Peer        = {peer_addr}", ANSI_GREEN))
+    print(_paint(f"LocalSeq    = {session.local_seq}", ANSI_GREEN))
+    print(_paint(f"RemoteSeq   = {session.remote_seq}", ANSI_GREEN))
+    print(_paint(f"ChunkSize   = {session.chunk_size}", ANSI_GREEN))
+    print(_paint(f"Mode        = {mode}", ANSI_GREEN))
+    print(_paint(f"Timeout     = {TIMEOUT_SECONDS:.2f}s", ANSI_GREEN))
+    print(_paint(f"MaxRetries  = {MAX_RETRIES}", ANSI_GREEN))
+
+
+# Prints phase markers to visually separate operation sequences
+def log_phase(title: str) -> None:
+    _section(title)
 
 
 # Parses semicolon-delimited key=value payload strings
@@ -307,8 +369,14 @@ def recv_packet(sock: socket.socket, timeout: Optional[float] = None) -> Tuple[P
         raise
     if WIRE_TRACE_ENABLED:
         print(
-            f"[{WIRE_TRACE_ROLE}] Message received from={addr} "
-            f"{_format_received_packet(packet)} {_paint('integrity=crc32_ok', ANSI_GREEN)}"
+            f"[{WIRE_TRACE_ROLE}][RECV] from={addr}, {_format_received_packet(packet)}"
+        )
+        print(
+            _paint(
+                f"[INTEGRITY] CRC32 verified: Type={packet.msg_type.name}, "
+                f"SeqNum={packet.seq}, SessionID={packet.session_id}",
+                ANSI_GREEN,
+            )
         )
     return packet, addr
 
@@ -316,7 +384,7 @@ def recv_packet(sock: socket.socket, timeout: Optional[float] = None) -> Tuple[P
 # Encodes and sends one packet to a peer address
 def send_packet(sock: socket.socket, addr: Tuple[str, int], packet: Packet) -> None:
     if WIRE_TRACE_ENABLED:
-        print(f"[{WIRE_TRACE_ROLE}] Message sent to={addr} {_format_sent_packet(packet)}")
+        print(f"[{WIRE_TRACE_ROLE}][SEND] to={addr}, {_format_sent_packet(packet)}")
     sock.sendto(packet.encode(), addr)
 
 
@@ -366,10 +434,12 @@ def send_with_retransmit(
     verbose: bool = False,
 ) -> None:
     last_error = "Timeout"
+    if WIRE_TRACE_ENABLED:
+        log_phase(f"Reliable Send Sequence: Type={packet.msg_type.name} SeqNum={packet.seq}")
     for attempt in range(1, MAX_RETRIES + 1):
         if attempt > 1:
             _retransmit_log(
-                f"retrying {packet.msg_type.name} seq={packet.seq} attempt={attempt}/{MAX_RETRIES}"
+                f"retry Type={packet.msg_type.name} SeqNum={packet.seq} Attempt={attempt}/{MAX_RETRIES}"
             )
         _trace(
             verbose,
@@ -380,17 +450,18 @@ def send_with_retransmit(
             expect_ack(sock, addr, packet.session_id, expect_ack_for, verbose=verbose)
             if attempt > 1:
                 _retransmit_log(
-                    f"recovered {packet.msg_type.name} seq={packet.seq} on attempt={attempt}/{MAX_RETRIES}"
+                    f"recovered Type={packet.msg_type.name} SeqNum={packet.seq} "
+                    f"on Attempt={attempt}/{MAX_RETRIES}"
                 )
             return
         except (socket.timeout, TimeoutError):
             last_error = "Timeout waiting for ACK"
             _trace(verbose, f"timeout waiting ACK for seq={expect_ack_for}")
-            _retransmit_log(f"timeout waiting ACK for seq={expect_ack_for}")
+            _retransmit_log(f"timeout waiting ACK for SeqNum={expect_ack_for}")
         except RDTError as exc:
             last_error = str(exc)
             _trace(verbose, f"retransmit reason: {last_error}")
-            _retransmit_log(f"retry reason for seq={expect_ack_for}: {last_error}")
+            _retransmit_log(f"retry reason for SeqNum={expect_ack_for}: {last_error}")
     raise TimeoutError(f"Retransmission failed: {last_error}")
 
 

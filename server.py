@@ -10,6 +10,8 @@ from rdt import (
     configure_test_delay_ms,
     configure_test_drop_ack,
     configure_security,
+    log_phase,
+    log_session_parameters,
     recv_file,
     recv_packet,
     send_file,
@@ -63,6 +65,7 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.host, args.port))
+    log_phase("Server Ready")
     print(f"[server] listening on {args.host}:{args.port}")
 
     try:
@@ -70,6 +73,8 @@ def main() -> None:
             try:
                 session, client_addr = server_handshake(sock, verbose=args.verbose)
                 print(f"[server] session={session.session_id} peer={client_addr}")
+                log_session_parameters(session, client_addr)
+                log_phase("Waiting for REQ")
                 req_pkt, req_addr = recv_packet(sock, timeout=5.0)
                 if req_addr != client_addr:
                     continue
@@ -95,6 +100,7 @@ def main() -> None:
                 op, filename = parse_req(req_plain)
                 if args.verbose:
                     print(f"[server] REQ {op} {filename} session={session.session_id}")
+                log_phase(f"Transfer Request: {op} {filename}")
                 safe_name = os.path.basename(filename)
                 path = os.path.join(args.storage, safe_name)
                 if op == "GET":

@@ -10,6 +10,8 @@ from rdt import (
     configure_test_delay_ms,
     configure_test_drop_ack,
     configure_security,
+    log_phase,
+    log_session_parameters,
     protect_payload,
     recv_file,
     send_file,
@@ -54,7 +56,10 @@ def main() -> None:
     sock.bind(("0.0.0.0", 0))
 
     try:
+        log_phase("Client Handshake")
         session = client_handshake(sock, server_addr, args.chunk_size, verbose=args.verbose)
+        log_session_parameters(session, server_addr)
+        log_phase(f"Sending REQ: {args.op.upper()} {args.remote_file}")
         req_payload = protect_payload(
             session,
             MsgType.REQ,
@@ -75,11 +80,13 @@ def main() -> None:
             print(f"[client] REQ {args.op.upper()} {args.remote_file} session={session.session_id}")
 
         if args.op == "get":
+            log_phase("Receiving File (GET)")
             received = recv_file(sock, server_addr, session, args.local_file, verbose=args.verbose)
             print(f"[client] downloaded {received} bytes -> {args.local_file}")
         else:
             if not os.path.exists(args.local_file):
                 raise FileNotFoundError(args.local_file)
+            log_phase("Sending File (PUT)")
             sent = send_file(sock, server_addr, session, args.local_file, verbose=args.verbose)
             print(f"[client] uploaded {sent} bytes <- {args.local_file}")
     except KeyboardInterrupt:

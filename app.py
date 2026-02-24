@@ -12,6 +12,8 @@ from rdt import (
     configure_test_delay_ms,
     configure_test_drop_ack,
     configure_security,
+    log_phase,
+    log_session_parameters,
     protect_payload,
     recv_file,
     recv_packet,
@@ -24,8 +26,19 @@ from rdt import (
 
 
 QUIT_WORDS = {"q", "quit", "exit"}
-LINE = "=" * 68
-SUBLINE = "-" * 68
+LINE = "=" * 44
+COLOR_ENABLED = os.environ.get("NO_COLOR") is None
+ANSI_RESET = "\x1b[0m"
+ANSI_BOLD = "\x1b[1m"
+ANSI_CYAN = "\x1b[96m"
+ANSI_BLUE = "\x1b[94m"
+ANSI_DIM = "\x1b[2m"
+
+
+def _paint(text: str, *styles: str) -> str:
+    if not COLOR_ENABLED or not styles:
+        return text
+    return "".join(styles) + text + ANSI_RESET
 
 
 # Parses a REQ payload into operation and filename
@@ -40,18 +53,16 @@ def parse_req(payload: bytes) -> Tuple[str, str]:
 
 # Prints the launcher banner
 def show_banner() -> None:
-    print(LINE)
-    print(" Reliable UDP File Transfer")
-    print(LINE)
+    print()
+    print(_paint("=== File Transfer Protocol ===", ANSI_CYAN))
+    print(_paint(" Reliable UDP File Transfer", ANSI_BLUE))
+    print(_paint(LINE, ANSI_DIM))
     print(" Type q/quit/exit at prompts or press Ctrl+C anytime to stop.")
-    print(SUBLINE)
 
 
 # Prints a titled section divider
 def show_section(title: str) -> None:
-    print(f"\n{SUBLINE}")
-    print(f" {title}")
-    print(SUBLINE)
+    print(f"\n{_paint(f'=== {title} ===', ANSI_CYAN)}")
 
 
 # Prompts for text input with a default value
@@ -151,12 +162,15 @@ def run_server(verbose: bool = False) -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
+    log_phase("Server Ready")
     print(f"[server] listening on {host}:{port}")
     try:
         while True:
             try:
                 session, client_addr = server_handshake(sock, verbose=verbose)
                 print(f"[server] session={session.session_id} peer={client_addr}")
+                log_session_parameters(session, client_addr)
+                log_phase("Waiting for REQ")
                 req_pkt, req_addr = recv_packet(sock, timeout=5.0)
                 if req_addr != client_addr:
                     continue
@@ -183,6 +197,7 @@ def run_server(verbose: bool = False) -> None:
                 op, filename = parse_req(req_plain)
                 if verbose:
                     print(f"[server] REQ {op} {filename} session={session.session_id}")
+                log_phase(f"Transfer Request: {op} {filename}")
                 safe_name = os.path.basename(filename)
                 path = os.path.join(storage, safe_name)
 
@@ -250,7 +265,10 @@ def run_client(verbose: bool = False) -> None:
     sock.bind(("0.0.0.0", 0))
 
     try:
+        log_phase("Client Handshake")
         session = client_handshake(sock, server_addr, chunk_size, verbose=verbose)
+        log_session_parameters(session, server_addr)
+        log_phase(f"Sending REQ: {op.upper()} {remote_file}")
         req_payload = protect_payload(
             session,
             MsgType.REQ,
@@ -271,11 +289,13 @@ def run_client(verbose: bool = False) -> None:
             print(f"[client] REQ {op.upper()} {remote_file} session={session.session_id}")
 
         if op == "get":
+            log_phase("Receiving File (GET)")
             received = recv_file(sock, server_addr, session, local_file, verbose=verbose)
             print(f"[client] downloaded {received} bytes -> {local_file}")
         else:
             if not os.path.exists(local_file):
                 raise FileNotFoundError(local_file)
+            log_phase("Sending File (PUT)")
             sent = send_file(sock, server_addr, session, local_file, verbose=verbose)
             print(f"[client] uploaded {sent} bytes <- {local_file}")
     except TimeoutError as exc:
@@ -338,9 +358,7 @@ def main() -> None:
 
         show_section("Mode Selection")
         mode = prompt_mode()
-        print(SUBLINE)
-        print(f" Launching in {mode.upper()} mode")
-        print(SUBLINE)
+        print(_paint(f"Launching in {mode.upper()} mode", ANSI_BLUE))
         if mode == "server":
             set_wire_trace(True, "SERVER")
             run_server(verbose=args.verbose)
