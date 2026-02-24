@@ -6,6 +6,7 @@ from protocol import MsgType, Packet
 from rdt import (
     RDTError,
     client_handshake,
+    configure_encryption,
     configure_test_drop_ack,
     configure_security,
     protect_payload,
@@ -16,6 +17,7 @@ from rdt import (
 )
 
 
+# Runs the CLI entrypoint for non-interactive client mode
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reliable UDP file transfer client")
     parser.add_argument("--server-host", required=True)
@@ -26,6 +28,7 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--secure-psk", default="", help="Enable secure mode with pre-shared key")
+    parser.add_argument("--no-encryption", action="store_true", help="Disable AEAD payload encryption for debugging")
     parser.add_argument(
         "--test-drop-ack",
         type=float,
@@ -33,6 +36,7 @@ def main() -> None:
         help="Test hook: probability [0.0-1.0] to drop outbound ACKs while receiving DATA",
     )
     args = parser.parse_args()
+    configure_encryption(not args.no_encryption)
     configure_security(args.secure_psk or None)
     configure_test_drop_ack(args.test_drop_ack)
     set_wire_trace(True, "CLIENT")

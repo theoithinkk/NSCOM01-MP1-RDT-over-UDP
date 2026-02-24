@@ -18,6 +18,7 @@ SECURITY_STATUS_PRINTED = False
 COLOR_ENABLED = os.environ.get("NO_COLOR") is None
 SECURE_PSK_BYTES: Optional[bytes] = None
 TEST_DROP_ACK_RATE = 0.0
+ENCRYPTION_ENABLED = True
 
 ANSI_RESET = "\x1b[0m"
 ANSI_DIM = "\x1b[2m"
@@ -31,6 +32,7 @@ ANSI_CYAN = "\x1b[36m"
 ANSI_WHITE = "\x1b[37m"
 
 
+# Stores per-session state shared by send/receive logic
 @dataclass
 class Session:
     session_id: int
@@ -41,16 +43,19 @@ class Session:
     secure_key: Optional[bytes] = None
 
 
+# Defines the base protocol-level exception used across RDT operations
 class RDTError(Exception):
     pass
 
 
+# Applies optional ANSI styles when terminal coloring is enabled
 def _paint(text: str, *styles: str) -> str:
     if not COLOR_ENABLED or not styles:
         return text
     return "".join(styles) + text + ANSI_RESET
 
 
+# Maps message types to display colors for wire tracing
 def _msg_style(msg_type: MsgType) -> str:
     return {
         MsgType.SYN: ANSI_BLUE,
@@ -64,20 +69,24 @@ def _msg_style(msg_type: MsgType) -> str:
     }.get(msg_type, ANSI_WHITE)
 
 
+# Emits verbose trace logs for debugging internal flow
 def _trace(verbose: bool, message: str) -> None:
     if verbose:
         print(_paint(f"[rdt] {message}", ANSI_DIM, ANSI_CYAN))
 
 
+# Emits security-related pass/fail logs
 def _security_log(message: str, ok: bool = True) -> None:
     color = ANSI_GREEN if ok else ANSI_RED
     print(_paint(f"[SECURITY] {message}", ANSI_BOLD, color))
 
 
+# Emits high-visibility retransmission logs
 def _retransmit_log(message: str) -> None:
     print(_paint(f"[RETRANSMIT] {message}", ANSI_BOLD, ANSI_YELLOW))
 
 
+# Ensures cryptography dependency exists before enabling secure mode
 def _require_crypto():
     try:
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305  # noqa: F401
@@ -87,33 +96,55 @@ def _require_crypto():
         ) from exc
 
 
+# Configures optional PSK used for secure handshake and key derivation
 def configure_security(psk: Optional[str]) -> None:
     global SECURE_PSK_BYTES
     if psk:
-        _require_crypto()
+        if ENCRYPTION_ENABLED:
+            _require_crypto()
         SECURE_PSK_BYTES = psk.encode("utf-8")
     else:
         SECURE_PSK_BYTES = None
 
 
+# Reports whether secure mode is currently enabled
 def security_enabled() -> bool:
     return SECURE_PSK_BYTES is not None
 
 
+# Configures whether AEAD payload encryption is enabled
+def configure_encryption(enabled: bool) -> None:
+    global ENCRYPTION_ENABLED
+    ENCRYPTION_ENABLED = enabled
+    if ENCRYPTION_ENABLED and SECURE_PSK_BYTES is not None:
+        _require_crypto()
+
+
+# Reports whether payload encryption is currently enabled
+def encryption_enabled() -> bool:
+    return ENCRYPTION_ENABLED
+
+
+# Configures test hook probability for dropping outbound ACKs
 def configure_test_drop_ack(rate: float) -> None:
     global TEST_DROP_ACK_RATE
     TEST_DROP_ACK_RATE = max(0.0, min(1.0, rate))
 
 
+# Enables wire tracing and prints one-time security mode summary
 def set_wire_trace(enabled: bool, role: str = "APP") -> None:
     global WIRE_TRACE_ENABLED, WIRE_TRACE_ROLE, SECURITY_STATUS_PRINTED
     WIRE_TRACE_ENABLED = enabled
     WIRE_TRACE_ROLE = role.upper()
     if enabled and not SECURITY_STATUS_PRINTED:
         if security_enabled():
+            if encryption_enabled():
+                mode_text = "integrity=crc32+sha256+aead, encryption=enabled, authentication=psk-hmac"
+            else:
+                mode_text = "integrity=crc32+sha256, encryption=disabled, authentication=psk-hmac"
             print(
                 _paint(
-                    "[SECURITY] integrity=crc32+sha256+aead, encryption=enabled, authentication=psk-hmac",
+                    f"[SECURITY] {mode_text}",
                     ANSI_BOLD,
                     ANSI_YELLOW,
                 )
@@ -129,10 +160,12 @@ def set_wire_trace(enabled: bool, role: str = "APP") -> None:
         SECURITY_STATUS_PRINTED = True
 
 
+# Builds a compact trace string for sent packets
 def _format_sent_packet(packet: Packet) -> str:
     return f"type={_paint(packet.msg_type.name, ANSI_BOLD, _msg_style(packet.msg_type))} segnum={packet.seq}"
 
 
+# Builds a compact trace string for received packets
 def _format_received_packet(packet: Packet) -> str:
     if packet.msg_type == MsgType.DATA:
         return (
@@ -142,6 +175,7 @@ def _format_received_packet(packet: Packet) -> str:
     return f"type={_paint(packet.msg_type.name, ANSI_BOLD, _msg_style(packet.msg_type))} segnum={packet.seq}"
 
 
+# Parses semicolon-delimited key=value payload strings
 def _parse_kv_payload(payload: bytes) -> Dict[str, str]:
     text = payload.decode("utf-8", errors="ignore").strip()
     out: Dict[str, str] = {}
@@ -153,34 +187,40 @@ def _parse_kv_payload(payload: bytes) -> Dict[str, str]:
     return out
 
 
+# Derives per-session AEAD key from PSK + nonces + session id
 def _derive_session_key(psk: bytes, cnonce: bytes, snonce: bytes, session_id: int) -> bytes:
     # HKDF-like derivation via HMAC-SHA256 for a single 32-byte key.
     salt = cnonce + snonce + struct.pack("!I", session_id)
     return hmac.new(psk, b"rdt-session-key|" + salt, hashlib.sha256).digest()
 
 
+# Builds server handshake proof using HMAC-SHA256 over transcript fields
 def _server_proof(psk: bytes, cnonce: bytes, snonce: bytes, client_isn: int, server_isn: int, session_id: int) -> str:
     material = b"server-proof|" + cnonce + snonce + struct.pack("!III", client_isn, server_isn, session_id)
     return hmac.new(psk, material, hashlib.sha256).hexdigest()
 
 
+# Builds client handshake proof using HMAC-SHA256 over transcript fields
 def _client_proof(psk: bytes, cnonce: bytes, snonce: bytes, client_isn: int, server_isn: int, session_id: int) -> str:
     material = b"client-proof|" + cnonce + snonce + struct.pack("!III", client_isn, server_isn, session_id)
     return hmac.new(psk, material, hashlib.sha256).hexdigest()
 
 
+# Constructs a deterministic 12-byte nonce from session/direction/sequence
 def _nonce(session_id: int, seq: int, from_client: bool) -> bytes:
     # 12-byte nonce: session_id(4) + dir(1) + seq(4) + pad(3)
     direction = b"\x01" if from_client else b"\x00"
     return struct.pack("!I", session_id) + direction + struct.pack("!I", seq) + b"\x00\x00\x00"
 
 
+# Builds AEAD additional authenticated data from packet metadata
 def _aad(msg_type: MsgType, session_id: int, seq: int, ack: int) -> bytes:
     return struct.pack("!BIII", int(msg_type), session_id, seq, ack)
 
 
+# Encrypts payload with AEAD when secure mode is active
 def _encrypt_payload(session: Session, msg_type: MsgType, seq: int, ack: int, payload: bytes, outbound: bool) -> bytes:
-    if not session.secure_key:
+    if not session.secure_key or not ENCRYPTION_ENABLED:
         return payload
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
@@ -190,8 +230,9 @@ def _encrypt_payload(session: Session, msg_type: MsgType, seq: int, ack: int, pa
     return ciphertext
 
 
+# Decrypts and authenticates payload with AEAD when secure mode is active
 def _decrypt_payload(session: Session, msg_type: MsgType, seq: int, ack: int, payload: bytes, outbound: bool) -> bytes:
-    if not session.secure_key:
+    if not session.secure_key or not ENCRYPTION_ENABLED:
         return payload
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
@@ -203,10 +244,12 @@ def _decrypt_payload(session: Session, msg_type: MsgType, seq: int, ack: int, pa
         raise RDTError("AEAD authentication failed") from exc
 
 
+# Encodes FIN metadata carrying total size and final SHA-256 digest
 def _build_fin_payload(total_size: int, digest_hex: str) -> bytes:
     return f"EOF|size={total_size}|sha256={digest_hex}".encode("utf-8")
 
 
+# Parses FIN metadata payload into expected size and hash
 def _parse_fin_payload(payload: bytes) -> Tuple[Optional[int], Optional[str]]:
     try:
         text = payload.decode("utf-8", errors="ignore").strip()
@@ -228,6 +271,7 @@ def _parse_fin_payload(payload: bytes) -> Tuple[Optional[int], Optional[str]]:
     return size_value, hash_value
 
 
+# Identifies Windows UDP reset errors that should be treated as transient
 def _is_connection_reset_error(exc: BaseException) -> bool:
     if isinstance(exc, ConnectionResetError):
         return True
@@ -236,6 +280,7 @@ def _is_connection_reset_error(exc: BaseException) -> bool:
     return getattr(exc, "winerror", None) == 10054
 
 
+# Receives and decodes one packet with optional timeout and CRC validation
 def recv_packet(sock: socket.socket, timeout: Optional[float] = None) -> Tuple[Packet, Tuple[str, int]]:
     sock.settimeout(timeout)
     try:
@@ -260,20 +305,24 @@ def recv_packet(sock: socket.socket, timeout: Optional[float] = None) -> Tuple[P
     return packet, addr
 
 
+# Encodes and sends one packet to a peer address
 def send_packet(sock: socket.socket, addr: Tuple[str, int], packet: Packet) -> None:
     if WIRE_TRACE_ENABLED:
         print(f"[{WIRE_TRACE_ROLE}] Message sent to={addr} {_format_sent_packet(packet)}")
     sock.sendto(packet.encode(), addr)
 
 
+# Encrypts payload based on current session settings
 def protect_payload(session: Session, msg_type: MsgType, seq: int, ack: int, payload: bytes, outbound: bool = True) -> bytes:
     return _encrypt_payload(session, msg_type, seq, ack, payload, outbound=outbound)
 
 
+# Decrypts payload based on current session settings
 def unprotect_payload(session: Session, msg_type: MsgType, seq: int, ack: int, payload: bytes, outbound: bool = False) -> bytes:
     return _decrypt_payload(session, msg_type, seq, ack, payload, outbound=outbound)
 
 
+# Waits for a matching ACK packet or raises protocol/timeout errors
 def expect_ack(
     sock: socket.socket,
     addr: Tuple[str, int],
@@ -300,6 +349,7 @@ def expect_ack(
     return pkt
 
 
+# Sends a packet with stop-and-wait retransmission until ACK or retry limit
 def send_with_retransmit(
     sock: socket.socket,
     addr: Tuple[str, int],
@@ -336,6 +386,7 @@ def send_with_retransmit(
     raise TimeoutError(f"Retransmission failed: {last_error}")
 
 
+# Runs client-side 3-way handshake plus optional secure proof verification
 def client_handshake(
     sock: socket.socket,
     server_addr: Tuple[str, int],
@@ -395,6 +446,7 @@ def client_handshake(
     raise TimeoutError("Handshake failed")
 
 
+# Runs server-side handshake loop that validates mode and optional client proof
 def server_handshake(sock: socket.socket, verbose: bool = False) -> Tuple[Session, Tuple[str, int]]:
     while True:
         pkt, addr = recv_packet(sock, timeout=None)
@@ -472,6 +524,7 @@ def server_handshake(sock: socket.socket, verbose: bool = False) -> Tuple[Sessio
             continue
 
 
+# Sends file chunks reliably then finalizes with FIN metadata and FIN-ACK wait
 def send_file(
     sock: socket.socket,
     addr: Tuple[str, int],
@@ -524,6 +577,7 @@ def send_file(
     raise TimeoutError("FIN/FIN-ACK failed")
 
 
+# Receives file chunks in order, ACKs each, and verifies final FIN hash/size
 def recv_file(
     sock: socket.socket,
     addr: Tuple[str, int],

@@ -9,6 +9,7 @@ HEADER_FMT = "!BIIIHI"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 
+# Defines message type identifiers exchanged over UDP
 class MsgType(enum.IntEnum):
     SYN = 1
     SYN_ACK = 2
@@ -20,6 +21,7 @@ class MsgType(enum.IntEnum):
     REQ = 8
 
 
+# Defines the packet model with encode/decode helpers and CRC32 protection
 @dataclass
 class Packet:
     msg_type: MsgType
@@ -28,6 +30,7 @@ class Packet:
     ack: int
     payload: bytes = b""
 
+    # Serializes a Packet into wire format and appends CRC32
     def encode(self) -> bytes:
         payload_len = len(self.payload)
         if payload_len > MAX_PAYLOAD:
@@ -53,6 +56,7 @@ class Packet:
         )
         return header + self.payload
 
+    # Parses wire bytes into a Packet and verifies CRC32/payload length
     @staticmethod
     def decode(datagram: bytes) -> "Packet":
         if len(datagram) < HEADER_SIZE:
@@ -78,5 +82,6 @@ class Packet:
         return Packet(MsgType(msg_raw), session_id, seq, ack, payload)
 
 
+# Builds a standard ERROR packet with UTF-8 payload text
 def build_error(session_id: int, seq: int, message: str) -> Packet:
     return Packet(MsgType.ERROR, session_id, seq, 0, message.encode("utf-8", errors="replace"))

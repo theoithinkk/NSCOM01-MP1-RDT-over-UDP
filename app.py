@@ -8,6 +8,7 @@ from protocol import MsgType, Packet
 from rdt import (
     RDTError,
     client_handshake,
+    configure_encryption,
     configure_test_drop_ack,
     configure_security,
     protect_payload,
@@ -26,6 +27,7 @@ LINE = "=" * 68
 SUBLINE = "-" * 68
 
 
+# Parses a REQ payload into operation and filename
 def parse_req(payload: bytes) -> Tuple[str, str]:
     txt = payload.decode("utf-8", errors="replace").strip()
     parts = txt.split(maxsplit=1)
@@ -35,6 +37,7 @@ def parse_req(payload: bytes) -> Tuple[str, str]:
     return op.upper(), filename
 
 
+# Prints the launcher banner
 def show_banner() -> None:
     print(LINE)
     print(" Reliable UDP File Transfer")
@@ -43,12 +46,14 @@ def show_banner() -> None:
     print(SUBLINE)
 
 
+# Prints a titled section divider
 def show_section(title: str) -> None:
     print(f"\n{SUBLINE}")
     print(f" {title}")
     print(SUBLINE)
 
 
+# Prompts for text input with a default value
 def prompt_text(label: str, default: str) -> str:
     value = input(f"> {label} [{default}]: ").strip()
     if value.lower() in QUIT_WORDS:
@@ -56,6 +61,7 @@ def prompt_text(label: str, default: str) -> str:
     return value or default
 
 
+# Prompts for an integer input constrained to a range
 def prompt_int(label: str, default: int, min_value: int = 1, max_value: int = 65535) -> int:
     while True:
         raw = input(f"> {label} [{default}]: ").strip()
@@ -72,6 +78,7 @@ def prompt_int(label: str, default: int, min_value: int = 1, max_value: int = 65
             print("Enter a valid integer.")
 
 
+# Prompts until a non-empty value is provided
 def prompt_required_text(label: str) -> str:
     while True:
         value = input(f"> {label}: ").strip()
@@ -82,6 +89,7 @@ def prompt_required_text(label: str) -> str:
         print(f"{label} is required.")
 
 
+# Prompts for runtime mode selection (server or client)
 def prompt_mode() -> str:
     while True:
         mode = input("> Select mode: [1] server, [2] client: ").strip().lower()
@@ -94,6 +102,7 @@ def prompt_mode() -> str:
         print("Invalid choice. Type 1 for server or 2 for client.")
 
 
+# Prompts for transfer operation (GET or PUT)
 def prompt_client_op() -> str:
     while True:
         op = input("> Operation: [1] get, [2] put: ").strip().lower()
@@ -106,6 +115,7 @@ def prompt_client_op() -> str:
         print("Invalid operation. Type 1 for get or 2 for put.")
 
 
+# Prompts for security mode selection
 def prompt_security_mode() -> str:
     while True:
         mode = input("> Security mode: [1] none, [2] psk-aead: ").strip().lower()
@@ -118,6 +128,7 @@ def prompt_security_mode() -> str:
         print("Invalid choice. Type 1 for none or 2 for psk-aead.")
 
 
+# Prompts for a hidden PSK input
 def prompt_psk() -> str:
     while True:
         secret = getpass.getpass("> Enter PSK (input hidden): ").strip()
@@ -128,6 +139,7 @@ def prompt_psk() -> str:
         print("PSK cannot be empty.")
 
 
+# Runs the interactive server workflow for one session at a time
 def run_server(verbose: bool = False) -> None:
     show_section("Server Configuration")
     host = prompt_text("Server host", "0.0.0.0")
@@ -212,6 +224,7 @@ def run_server(verbose: bool = False) -> None:
         sock.close()
 
 
+# Runs the interactive client workflow for GET/PUT operations
 def run_client(verbose: bool = False) -> None:
     show_section("Client Configuration")
     server_host = prompt_text("Server host", "127.0.0.1")
@@ -279,10 +292,12 @@ def run_client(verbose: bool = False) -> None:
         sock.close()
 
 
+# Parses CLI flags, configures security/test hooks, and launches selected mode
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reliable UDP file transfer interactive launcher")
     parser.add_argument("--verbose", action="store_true", help="Show handshake/session/data debug logs")
     parser.add_argument("--secure-psk", default="", help="Enable secure mode with pre-shared key")
+    parser.add_argument("--no-encryption", action="store_true", help="Disable AEAD payload encryption for debugging")
     parser.add_argument(
         "--test-drop-ack",
         type=float,
@@ -296,14 +311,18 @@ def main() -> None:
         print("[app] verbose mode enabled")
     try:
         show_section("Security Configuration")
+        configure_encryption(not args.no_encryption)
+        secure_label = "psk-aead" if not args.no_encryption else "psk-auth"
+        if args.no_encryption:
+            print("[app] payload encryption: disabled (--no-encryption)")
         if args.secure_psk:
             configure_security(args.secure_psk)
-            print("[app] security mode: psk-aead (from --secure-psk)")
+            print(f"[app] security mode: {secure_label} (from --secure-psk)")
         else:
             sec_mode = prompt_security_mode()
             if sec_mode == "psk-aead":
                 configure_security(prompt_psk())
-                print("[app] security mode: psk-aead")
+                print(f"[app] security mode: {secure_label}")
             else:
                 configure_security(None)
                 print("[app] security mode: none")
