@@ -1,3 +1,23 @@
+"""
+Reliable Data Transfer (RDT) layer for a UDP-based file transfer protocol.
+
+This module provides:
+- Session state tracking (sequence numbers, chunk sizing, security key)
+- Stop-and-wait reliability (retransmissions + ACK validation)
+- Integrity checks:
+  - CRC32 at the packet layer (Packet.decode)
+  - End-to-end SHA-256 verification (FIN metadata)
+- Optional secure mode:
+  - PSK-based handshake authentication (HMAC-SHA256 proofs)
+  - Per-session key derivation (HMAC-SHA256)
+  - Optional AEAD payload protection (ChaCha20-Poly1305)
+- Test hooks for ACK drop/delay to simulate network loss/latency
+
+NOTES:
+- CRC32 verification happens before payload processing.
+- If secure mode is active, payloads are additionally authenticated/encrypted by AEAD.
+"""
+
 import hashlib
 import hmac
 import os

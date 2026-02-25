@@ -1,3 +1,12 @@
+"""
+Non-interactive CLI server for the Reliable UDP File Transfer protocol.
+
+This server:
+- Performs a handshake to establish a session (plain or secure PSK mode).
+- Waits for a REQ packet from the same peer address.
+- Executes GET (send file) or PUT (receive file) using reliable stop-and-wait logic.
+- Supports test hooks for ACK drop/delay simulation and optional AEAD disabling.
+"""
 import argparse
 import os
 import socket
@@ -23,8 +32,13 @@ from rdt import (
 )
 
 
-# Parses a REQ payload into operation and filename
 def parse_req(payload: bytes) -> Tuple[str, str]:
+    """Parse a REQ payload into (operation, filename).
+
+    Expected format (UTF-8 text): "<OP> <FILENAME>"
+    - OP is typically GET or PUT (case-insensitive).
+    - Filename is treated as a single token after the first whitespace split.
+    """
     txt = payload.decode("utf-8", errors="replace").strip()
     parts = txt.split(maxsplit=1)
     if len(parts) != 2:
@@ -33,8 +47,15 @@ def parse_req(payload: bytes) -> Tuple[str, str]:
     return op.upper(), filename
 
 
-# Runs the CLI entrypoint for non-interactive server mode
 def main() -> None:
+    """Run the CLI entrypoint for non-interactive server mode.
+
+    Steps performed:
+    1. Parse command-line arguments.
+    2. Configure security/encryption and test hooks.
+    3. Bind UDP socket and wait for sessions.
+    4. For each session: accept handshake, wait for REQ, then serve GET/PUT.
+    """
     parser = argparse.ArgumentParser(description="Reliable UDP file transfer server")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9000)
@@ -55,6 +76,8 @@ def main() -> None:
         help="Test hook: fixed millisecond delay before outbound ACKs while receiving DATA",
     )
     args = parser.parse_args()
+
+    # Configure runtime security/testing behavior.
     configure_encryption(not args.no_encryption)
     configure_security(args.secure_psk or None)
     configure_test_drop_ack(args.test_drop_ack)
@@ -65,6 +88,7 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.host, args.port))
+
     log_phase("Server Ready")
     print(f"[server] listening on {args.host}:{args.port}")
 
@@ -74,10 +98,15 @@ def main() -> None:
                 session, client_addr = server_handshake(sock, verbose=args.verbose)
                 print(f"[server] session={session.session_id} peer={client_addr}")
                 log_session_parameters(session, client_addr)
+
                 log_phase("Waiting for REQ")
                 req_pkt, req_addr = recv_packet(sock, timeout=5.0)
+
+                # Ignore packets from other peers while handling this session.
                 if req_addr != client_addr:
                     continue
+
+                # Enforce session + message type before decrypting/parsing the request payload.
                 if req_pkt.session_id != session.session_id or req_pkt.msg_type != MsgType.REQ:
                     err_payload = protect_payload(
                         session,
@@ -87,8 +116,13 @@ def main() -> None:
                         b"Session mismatch",
                         outbound=True,
                     )
-                    send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
+                    send_packet(
+                        sock,
+                        client_addr,
+                        Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload),
+                    )
                     continue
+
                 req_plain = unprotect_payload(
                     session,
                     MsgType.REQ,
@@ -97,12 +131,17 @@ def main() -> None:
                     req_pkt.payload,
                     outbound=False,
                 )
+
                 op, filename = parse_req(req_plain)
+
                 if args.verbose:
                     print(f"[server] REQ {op} {filename} session={session.session_id}")
+
                 log_phase(f"Transfer Request: {op} {filename}")
+
                 safe_name = os.path.basename(filename)
                 path = os.path.join(args.storage, safe_name)
+
                 if op == "GET":
                     if not os.path.exists(path):
                         err_payload = protect_payload(
@@ -113,13 +152,20 @@ def main() -> None:
                             b"File not found",
                             outbound=True,
                         )
-                        send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
+                        send_packet(
+                            sock,
+                            client_addr,
+                            Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload),
+                        )
                         continue
+
                     sent = send_file(sock, client_addr, session, path, verbose=args.verbose)
                     print(f"[server] sent {sent} bytes -> {safe_name}")
+
                 elif op == "PUT":
                     received = recv_file(sock, client_addr, session, path, verbose=args.verbose)
                     print(f"[server] received {received} bytes <- {safe_name}")
+
                 else:
                     err_payload = protect_payload(
                         session,
@@ -129,13 +175,19 @@ def main() -> None:
                         b"Unknown operation",
                         outbound=True,
                     )
-                    send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
+                    send_packet(
+                        sock,
+                        client_addr,
+                        Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload),
+                    )
+
             except TimeoutError:
                 print("[server] timeout; session dropped")
             except RDTError as exc:
                 print(f"[server] protocol error: {exc}")
             except Exception as exc:
                 print(f"[server] error: {exc}")
+
     except KeyboardInterrupt:
         print("\n[server] terminated by user")
     finally:

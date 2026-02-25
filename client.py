@@ -1,3 +1,11 @@
+"""
+Non-interactive CLI client for the Reliable UDP File Transfer protocol.
+
+This client performs GET or PUT operations using command-line arguments
+instead of the interactive launcher. It supports optional PSK-based
+security and testing hooks for ACK delay/drop simulation.
+"""
+
 import argparse
 import os
 import socket
@@ -20,8 +28,16 @@ from rdt import (
 )
 
 
-# Runs the CLI entrypoint for non-interactive client mode
 def main() -> None:
+    """Run the CLI entrypoint for non-interactive client mode.
+
+    Steps performed:
+    1. Parse command-line arguments.
+    2. Configure security and testing hooks.
+    3. Perform client handshake with the server.
+    4. Send a REQ packet (GET or PUT).
+    5. Transfer the file using the established session.
+    """
     parser = argparse.ArgumentParser(description="Reliable UDP file transfer client")
     parser.add_argument("--server-host", required=True)
     parser.add_argument("--server-port", type=int, required=True)
@@ -44,7 +60,10 @@ def main() -> None:
         default=0,
         help="Test hook: fixed millisecond delay before outbound ACKs while receiving DATA",
     )
+
     args = parser.parse_args()
+
+    # Configure runtime security and testing behavior.
     configure_encryption(not args.no_encryption)
     configure_security(args.secure_psk or None)
     configure_test_drop_ack(args.test_drop_ack)
@@ -59,7 +78,10 @@ def main() -> None:
         log_phase("Client Handshake")
         session = client_handshake(sock, server_addr, args.chunk_size, verbose=args.verbose)
         log_session_parameters(session, server_addr)
+
         log_phase(f"Sending REQ: {args.op.upper()} {args.remote_file}")
+
+        # Build protected REQ payload containing operation and filename.
         req_payload = protect_payload(
             session,
             MsgType.REQ,
@@ -68,6 +90,7 @@ def main() -> None:
             f"{args.op.upper()} {args.remote_file}".encode("utf-8"),
             outbound=True,
         )
+
         req = Packet(
             msg_type=MsgType.REQ,
             session_id=session.session_id,
@@ -75,7 +98,9 @@ def main() -> None:
             ack=0,
             payload=req_payload,
         )
+
         send_packet(sock, server_addr, req)
+
         if args.verbose:
             print(f"[client] REQ {args.op.upper()} {args.remote_file} session={session.session_id}")
 
@@ -86,9 +111,11 @@ def main() -> None:
         else:
             if not os.path.exists(args.local_file):
                 raise FileNotFoundError(args.local_file)
+
             log_phase("Sending File (PUT)")
             sent = send_file(sock, server_addr, session, args.local_file, verbose=args.verbose)
             print(f"[client] uploaded {sent} bytes <- {args.local_file}")
+
     except KeyboardInterrupt:
         print("\n[client] terminated by user")
     except TimeoutError as exc:
