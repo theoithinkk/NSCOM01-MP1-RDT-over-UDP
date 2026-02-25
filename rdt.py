@@ -9,7 +9,14 @@ import ctypes
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from protocol import MAX_PAYLOAD, MsgType, Packet, build_error
+from protocol import (
+    MAX_PAYLOAD,
+    MsgType,
+    Packet,
+    build_error,
+    decode_error_payload,
+    encode_error_payload,
+)
 
 
 TIMEOUT_SECONDS = 0.8
@@ -33,6 +40,7 @@ ANSI_BLUE = "\x1b[94m"
 ANSI_MAGENTA = "\x1b[95m"
 ANSI_CYAN = "\x1b[96m"
 ANSI_WHITE = "\x1b[97m"
+ANSI_BG_RED = "\x1b[41m"
 LOG_LINE = "=" * 44
 
 
@@ -108,7 +116,7 @@ def _security_log(message: str, ok: bool = True) -> None:
 
 # Emits high-visibility retransmission logs
 def _retransmit_log(message: str) -> None:
-    print(_paint(f"[RETRANSMIT] {message}", ANSI_BOLD, ANSI_YELLOW))
+    print(_paint(f"[RETRANSMIT ALERT] {message}", ANSI_BOLD, ANSI_BG_RED, ANSI_WHITE))
 
 
 # Prints a section divider for easier scanning of grouped logs
@@ -243,6 +251,30 @@ def log_session_parameters(session: Session, peer_addr: Tuple[str, int]) -> None
 # Prints phase markers to visually separate operation sequences
 def log_phase(title: str) -> None:
     _section(title)
+
+
+# Formats a decoded ERROR payload into a stable exception message
+def _error_exception_message(payload: bytes) -> str:
+    code, message = decode_error_payload(payload)
+    if code and code != "UNKNOWN":
+        return f"{code}: {message}"
+    return message
+
+
+# Sends a protocol ERROR packet with optional payload protection
+def send_error_packet(
+    sock: socket.socket,
+    addr: Tuple[str, int],
+    session_id: int,
+    seq: int,
+    code: str,
+    message: str,
+    session: Optional[Session] = None,
+) -> None:
+    payload = encode_error_payload(code, message)
+    if session is not None:
+        payload = _encrypt_payload(session, MsgType.ERROR, seq, 0, payload, outbound=True)
+    send_packet(sock, addr, Packet(MsgType.ERROR, session_id, seq, 0, payload))
 
 
 # Parses semicolon-delimited key=value payload strings
@@ -414,7 +446,7 @@ def expect_ack(
         _trace(verbose, f"session mismatch while waiting ACK: got={pkt.session_id} expected={session_id}")
         raise RDTError("Session mismatch")
     if pkt.msg_type == MsgType.ERROR:
-        raise RDTError(pkt.payload.decode("utf-8", errors="replace"))
+        raise RDTError(_error_exception_message(pkt.payload))
     if pkt.msg_type != MsgType.ACK or pkt.ack != expect_ack_for:
         _trace(
             verbose,
@@ -492,6 +524,8 @@ def client_handshake(
             pkt, addr = recv_packet(sock, timeout=TIMEOUT_SECONDS)
             if addr != server_addr:
                 continue
+            if pkt.msg_type == MsgType.ERROR:
+                raise RDTError(_error_exception_message(pkt.payload))
             if pkt.msg_type != MsgType.SYN_ACK:
                 continue
             if pkt.ack != client_isn:
@@ -543,11 +577,11 @@ def server_handshake(sock: socket.socket, verbose: bool = False) -> Tuple[Sessio
 
         secure_requested = fields.get("secure", "0") == "1"
         if secure_requested and not security_enabled():
-            err = build_error(0, 0, "Secure mode requested but server PSK not configured")
+            err = build_error(0, 0, "Secure mode requested but server PSK not configured", code="SECURE_REQUIRED")
             send_packet(sock, addr, err)
             continue
         if not secure_requested and security_enabled():
-            err = build_error(0, 0, "Server requires secure mode")
+            err = build_error(0, 0, "Server requires secure mode", code="SECURE_REQUIRED")
             send_packet(sock, addr, err)
             continue
 
@@ -561,7 +595,7 @@ def server_handshake(sock: socket.socket, verbose: bool = False) -> Tuple[Sessio
         if secure_requested:
             cnonce_hex = fields.get("cnonce")
             if not cnonce_hex:
-                err = build_error(0, 0, "Secure handshake missing cnonce")
+                err = build_error(0, 0, "Secure handshake missing cnonce", code="SECURE_HANDSHAKE_FAILED")
                 send_packet(sock, addr, err)
                 continue
             cnonce = bytes.fromhex(cnonce_hex)
@@ -586,13 +620,23 @@ def server_handshake(sock: socket.socket, verbose: bool = False) -> Tuple[Sessio
                 afields = _parse_kv_payload(ack.payload)
                 cproof = afields.get("cproof")
                 if not cproof:
-                    err = build_error(session_id, 0, "Secure handshake missing client proof")
+                    err = build_error(
+                        session_id,
+                        0,
+                        "Secure handshake missing client proof",
+                        code="SECURE_HANDSHAKE_FAILED",
+                    )
                     send_packet(sock, addr, err)
                     continue
                 assert SECURE_PSK_BYTES is not None
                 expect = _client_proof(SECURE_PSK_BYTES, cnonce, snonce, pkt.seq, server_isn, session_id)
                 if not hmac.compare_digest(expect, cproof):
-                    err = build_error(session_id, 0, "Secure handshake invalid client proof")
+                    err = build_error(
+                        session_id,
+                        0,
+                        "Secure handshake invalid client proof",
+                        code="SECURE_HANDSHAKE_FAILED",
+                    )
                     send_packet(sock, addr, err)
                     continue
                 secure_key = _derive_session_key(SECURE_PSK_BYTES, cnonce, snonce, session_id)
@@ -647,7 +691,7 @@ def send_file(
                 continue
             if pkt.msg_type == MsgType.ERROR:
                 err_payload = _decrypt_payload(session, MsgType.ERROR, pkt.seq, pkt.ack, pkt.payload, outbound=False)
-                raise RDTError(err_payload.decode("utf-8", errors="replace"))
+                raise RDTError(_error_exception_message(err_payload))
             if pkt.msg_type == MsgType.FIN_ACK and pkt.ack == seq:
                 session.local_seq = seq
                 return sent_total
@@ -674,7 +718,7 @@ def recv_file(
             if from_addr != addr:
                 continue
             if pkt.session_id != session.session_id:
-                err = build_error(session.session_id, 0, "Session mismatch")
+                err = build_error(session.session_id, 0, "Session mismatch", code="SESSION_MISMATCH")
                 send_packet(sock, addr, err)
                 continue
 
@@ -713,34 +757,48 @@ def recv_file(
                 actual_hash = hasher.hexdigest()
 
                 if expected_size is not None and expected_size != got_total:
-                    err_payload = _encrypt_payload(
-                        session,
-                        MsgType.ERROR,
+                    send_error_packet(
+                        sock,
+                        addr,
+                        session.session_id,
                         session.local_seq,
-                        0,
-                        b"File size mismatch",
-                        outbound=True,
+                        code="FILE_SIZE_MISMATCH",
+                        message="File size mismatch",
+                        session=session,
                     )
-                    err = Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload)
-                    send_packet(sock, addr, err)
                     _security_log(
                         f"SHA-256 verification failed (size mismatch expected={expected_size} actual={got_total})",
                         ok=False,
                     )
+                    if out is not None:
+                        out.close()
+                        out = None
+                    try:
+                        if os.path.exists(destination_path):
+                            os.remove(destination_path)
+                    except OSError:
+                        pass
                     raise RDTError("File size mismatch")
 
                 if expected_hash and expected_hash != actual_hash:
-                    err_payload = _encrypt_payload(
-                        session,
-                        MsgType.ERROR,
+                    send_error_packet(
+                        sock,
+                        addr,
+                        session.session_id,
                         session.local_seq,
-                        0,
-                        b"SHA256 mismatch",
-                        outbound=True,
+                        code="SHA256_MISMATCH",
+                        message="SHA256 mismatch",
+                        session=session,
                     )
-                    err = Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload)
-                    send_packet(sock, addr, err)
                     _security_log("SHA-256 verification failed (digest mismatch)", ok=False)
+                    if out is not None:
+                        out.close()
+                        out = None
+                    try:
+                        if os.path.exists(destination_path):
+                            os.remove(destination_path)
+                    except OSError:
+                        pass
                     raise RDTError("SHA256 mismatch")
 
                 if out is None:
@@ -756,19 +814,18 @@ def recv_file(
 
             elif pkt.msg_type == MsgType.ERROR:
                 err_payload = _decrypt_payload(session, MsgType.ERROR, pkt.seq, pkt.ack, pkt.payload, outbound=False)
-                raise RDTError(err_payload.decode("utf-8", errors="replace"))
+                raise RDTError(_error_exception_message(err_payload))
 
             else:
-                err_payload = _encrypt_payload(
-                    session,
-                    MsgType.ERROR,
-                    session.local_seq,
+                send_error_packet(
+                    sock,
+                    addr,
+                    session.session_id,
                     0,
-                    b"Unexpected packet type",
-                    outbound=True,
+                    code="UNEXPECTED_PACKET",
+                    message="Unexpected packet type",
+                    session=session,
                 )
-                err = Packet(MsgType.ERROR, session.session_id, 0, 0, err_payload)
-                send_packet(sock, addr, err)
     finally:
         if out is not None:
             out.close()

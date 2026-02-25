@@ -15,12 +15,21 @@ from rdt import (
     recv_file,
     recv_packet,
     send_file,
-    send_packet,
+    send_error_packet,
     server_handshake,
     set_wire_trace,
-    protect_payload,
     unprotect_payload,
 )
+
+COLOR_ENABLED = os.environ.get("NO_COLOR") is None
+ANSI_RESET = "\x1b[0m"
+ANSI_DARK_RED = "\x1b[31m"
+
+
+def _paint(text: str, *styles: str) -> str:
+    if not COLOR_ENABLED or not styles:
+        return text
+    return "".join(styles) + text + ANSI_RESET
 
 
 # Parses a REQ payload into operation and filename
@@ -79,15 +88,15 @@ def main() -> None:
                 if req_addr != client_addr:
                     continue
                 if req_pkt.session_id != session.session_id or req_pkt.msg_type != MsgType.REQ:
-                    err_payload = protect_payload(
-                        session,
-                        MsgType.ERROR,
+                    send_error_packet(
+                        sock,
+                        client_addr,
+                        session.session_id,
                         session.local_seq,
-                        0,
-                        b"Session mismatch",
-                        outbound=True,
+                        code="SESSION_MISMATCH",
+                        message="Session mismatch",
+                        session=session,
                     )
-                    send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
                     continue
                 req_plain = unprotect_payload(
                     session,
@@ -97,7 +106,19 @@ def main() -> None:
                     req_pkt.payload,
                     outbound=False,
                 )
-                op, filename = parse_req(req_plain)
+                try:
+                    op, filename = parse_req(req_plain)
+                except ValueError:
+                    send_error_packet(
+                        sock,
+                        client_addr,
+                        session.session_id,
+                        session.local_seq,
+                        code="BAD_REQUEST",
+                        message="Invalid request",
+                        session=session,
+                    )
+                    continue
                 if args.verbose:
                     print(f"[server] REQ {op} {filename} session={session.session_id}")
                 log_phase(f"Transfer Request: {op} {filename}")
@@ -105,15 +126,15 @@ def main() -> None:
                 path = os.path.join(args.storage, safe_name)
                 if op == "GET":
                     if not os.path.exists(path):
-                        err_payload = protect_payload(
-                            session,
-                            MsgType.ERROR,
+                        send_error_packet(
+                            sock,
+                            client_addr,
+                            session.session_id,
                             session.local_seq,
-                            0,
-                            b"File not found",
-                            outbound=True,
+                            code="FILE_NOT_FOUND",
+                            message="File not found",
+                            session=session,
                         )
-                        send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
                         continue
                     sent = send_file(sock, client_addr, session, path, verbose=args.verbose)
                     print(f"[server] sent {sent} bytes -> {safe_name}")
@@ -121,19 +142,19 @@ def main() -> None:
                     received = recv_file(sock, client_addr, session, path, verbose=args.verbose)
                     print(f"[server] received {received} bytes <- {safe_name}")
                 else:
-                    err_payload = protect_payload(
-                        session,
-                        MsgType.ERROR,
+                    send_error_packet(
+                        sock,
+                        client_addr,
+                        session.session_id,
                         session.local_seq,
-                        0,
-                        b"Unknown operation",
-                        outbound=True,
+                        code="BAD_REQUEST",
+                        message="Unknown operation",
+                        session=session,
                     )
-                    send_packet(sock, client_addr, Packet(MsgType.ERROR, session.session_id, session.local_seq, 0, err_payload))
             except TimeoutError:
                 print("[server] timeout; session dropped")
             except RDTError as exc:
-                print(f"[server] protocol error: {exc}")
+                print(_paint(f"[server] protocol error: {exc}", ANSI_DARK_RED))
             except Exception as exc:
                 print(f"[server] error: {exc}")
     except KeyboardInterrupt:

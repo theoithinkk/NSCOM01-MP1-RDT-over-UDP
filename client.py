@@ -19,6 +19,16 @@ from rdt import (
     set_wire_trace,
 )
 
+COLOR_ENABLED = os.environ.get("NO_COLOR") is None
+ANSI_RESET = "\x1b[0m"
+ANSI_DARK_RED = "\x1b[31m"
+
+
+def _paint(text: str, *styles: str) -> str:
+    if not COLOR_ENABLED or not styles:
+        return text
+    return "".join(styles) + text + ANSI_RESET
+
 
 # Runs the CLI entrypoint for non-interactive client mode
 def main() -> None:
@@ -96,10 +106,14 @@ def main() -> None:
     except FileNotFoundError as exc:
         print(f"[client] file not found: {exc}")
     except RDTError as exc:
-        if str(exc).strip().lower() == "file not found":
+        err_text = str(exc).strip()
+        err_upper = err_text.upper()
+        if "FILE_NOT_FOUND" in err_upper or err_text.lower() == "file not found":
             print("[client] file not found")
+        elif "BAD_REQUEST" in err_upper:
+            print(f"[client] bad request: {err_text}")
         else:
-            print(f"[client] protocol error: {exc}")
+            print(_paint(f"[client] protocol error: {err_text}", ANSI_DARK_RED))
     except Exception as exc:
         print(f"[client] error: {exc}")
     finally:

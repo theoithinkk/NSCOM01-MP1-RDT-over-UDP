@@ -2,6 +2,7 @@ import enum
 import struct
 import zlib
 from dataclasses import dataclass
+from typing import Tuple
 
 
 MAX_PAYLOAD = 1024
@@ -82,6 +83,24 @@ class Packet:
         return Packet(MsgType(msg_raw), session_id, seq, ack, payload)
 
 
-# Builds a standard ERROR packet with UTF-8 payload text
-def build_error(session_id: int, seq: int, message: str) -> Packet:
-    return Packet(MsgType.ERROR, session_id, seq, 0, message.encode("utf-8", errors="replace"))
+# Encodes a structured ERROR payload as key/value text
+def encode_error_payload(code: str, message: str) -> bytes:
+    safe_code = (code or "UNKNOWN").strip().upper().replace(";", "_")
+    safe_message = (message or "").strip().replace(";", ",")
+    return f"code={safe_code};msg={safe_message}".encode("utf-8", errors="replace")
+
+
+# Decodes structured ERROR payload text into (code, message)
+def decode_error_payload(payload: bytes) -> Tuple[str, str]:
+    text = payload.decode("utf-8", errors="replace").strip()
+    if text.startswith("code=") and ";msg=" in text:
+        code_part, msg_part = text.split(";msg=", 1)
+        code = code_part.split("=", 1)[1].strip().upper() or "UNKNOWN"
+        message = msg_part.strip()
+        return code, message
+    return "UNKNOWN", text
+
+
+# Builds a standard ERROR packet with structured payload
+def build_error(session_id: int, seq: int, message: str, code: str = "UNKNOWN") -> Packet:
+    return Packet(MsgType.ERROR, session_id, seq, 0, encode_error_payload(code, message))
